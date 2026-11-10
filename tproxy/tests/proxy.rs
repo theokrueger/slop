@@ -59,6 +59,12 @@ async fn spawn(app: Router) -> SocketAddr {
 }
 
 async fn setup() -> (SocketAddr, mpsc::UnboundedReceiver<(HeaderMap, Value)>) {
+    setup_with(|_| {}).await
+}
+
+async fn setup_with(
+    configure: impl FnOnce(&mut Config),
+) -> (SocketAddr, mpsc::UnboundedReceiver<(HeaderMap, Value)>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let upstream = Router::new()
         .route("/v1/chat/completions", post(capture))
@@ -81,6 +87,7 @@ async fn setup() -> (SocketAddr, mpsc::UnboundedReceiver<(HeaderMap, Value)>) {
     );
     config.users.insert("me".into(), "sk-test".into());
     config.server.allowed_paths.push("/v1/error".into());
+    configure(&mut config);
     let proxy_addr = spawn(proxy::router(AppState::new(config).unwrap())).await;
     (proxy_addr, rx)
 }
@@ -115,6 +122,19 @@ async fn forwards_request_and_streams_response() {
     assert_eq!(headers["openai-beta"], "test-beta");
     assert!(headers.get("x-test").is_none());
     assert!(headers.get("x-forwarded-for").is_none());
+}
+
+#[tokio::test]
+async fn serves_health_without_auth() {
+    let (proxy_addr, _captured) = setup().await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/health"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "ok");
 }
 
 #[tokio::test]
@@ -259,11 +279,12 @@ async fn records_usage_and_serves_dashboard() {
 
 #[tokio::test]
 async fn rate_limits_bad_auth_by_ip() {
-    let (proxy_addr, _captured) = setup().await;
+    const LIMIT: u32 = 5;
+    let (proxy_addr, _captured) = setup_with(|config| config.server.rate_limit = LIMIT).await;
     let client = reqwest::Client::new();
     let url = format!("http://{proxy_addr}/v1/models");
 
-    for _ in 0..100 {
+    for _ in 0..LIMIT {
         let response = client.get(&url).bearer_auth("wrong").send().await.unwrap();
         assert_eq!(response.status(), 401);
     }
@@ -283,11 +304,12 @@ async fn rate_limits_bad_auth_by_ip() {
 
 #[tokio::test]
 async fn rate_limits_authenticated_requests() {
-    let (proxy_addr, _captured) = setup().await;
+    const LIMIT: u32 = 5;
+    let (proxy_addr, _captured) = setup_with(|config| config.server.rate_limit = LIMIT).await;
     let client = reqwest::Client::new();
     let url = format!("http://{proxy_addr}/v1/models");
 
-    for _ in 0..100 {
+    for _ in 0..LIMIT {
         let response = client
             .get(&url)
             .bearer_auth("sk-test")

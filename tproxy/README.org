@@ -14,6 +14,8 @@ cargo install --path .
 tproxy --help
 #+end_src
 
+Building requires Rust 1.88 or newer.
+
 The server refuses to start as root. Run it as an unprivileged user; the
 systemd user service below is one option.
 
@@ -246,9 +248,7 @@ pi -e ./extensions/pi.ts
 #+end_src
 
 Authenticate with =/login tproxy=, then open =/model= once to trigger
-discovery. See [[file:CONFIG.org][CONFIG.org]] for Pi =models.json= overrides. The same
-extension file is also available at the originally requested path,
-=exensions/pi.ts=.
+discovery. See [[file:CONFIG.org][CONFIG.org]] for Pi =models.json= overrides.
 
 * Tests
 

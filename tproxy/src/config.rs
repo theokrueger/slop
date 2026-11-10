@@ -214,15 +214,13 @@ impl Config {
             if !url.username().is_empty() || url.password().is_some() {
                 bail!("model {alias:?} endpoint must not contain credentials; use api_key");
             }
-            if url.scheme() == "http" && !self.server.allow_insecure_upstream {
-                let host = url.host_str().unwrap_or_default();
-                let loopback = host.eq_ignore_ascii_case("localhost")
-                    || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
-                if !loopback {
-                    bail!(
-                        "model {alias:?} uses plaintext HTTP; use HTTPS or set server.allow_insecure_upstream: true"
-                    );
-                }
+            if url.scheme() == "http"
+                && !self.server.allow_insecure_upstream
+                && !is_loopback_host(url.host_str().unwrap_or_default())
+            {
+                bail!(
+                    "model {alias:?} uses plaintext HTTP; use HTTPS or set server.allow_insecure_upstream: true"
+                );
             }
             if model.context_window == 0 {
                 bail!("model {alias:?} context_window must be greater than zero");
@@ -243,6 +241,16 @@ impl Config {
             {
                 bail!("model {alias:?} name cannot be empty");
             }
+            if let Some(modelname) = &model.modelname
+                && modelname.trim().is_empty()
+            {
+                bail!("model {alias:?} modelname cannot be empty");
+            }
+            if let Some(api_key) = &model.api_key
+                && api_key.trim().is_empty()
+            {
+                bail!("model {alias:?} api_key cannot be empty");
+            }
             if [
                 model.cost.input,
                 model.cost.output,
@@ -262,6 +270,9 @@ impl Config {
             if key.is_empty() {
                 bail!("user {name:?} has an empty API key");
             }
+            if key.chars().any(char::is_whitespace) {
+                bail!("user {name:?} API key must not contain whitespace");
+            }
         }
         Ok(())
     }
@@ -277,6 +288,17 @@ impl Config {
             .with_context(|| format!("set permissions on {}", path.display()))?;
         Ok(())
     }
+}
+
+/// Whether an upstream host is loopback. `Url::host_str` keeps the brackets
+/// around IPv6 literals, so strip them before parsing as an address.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 pub fn warn_if_insecure(path: &Path) {
@@ -396,6 +418,70 @@ users:
             },
         );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_model_fields() {
+        let mut config = Config::default();
+        let model = Model {
+            endpoint: "https://example.com/v1".into(),
+            ..Default::default()
+        };
+        config.models.insert("alias".into(), model.clone());
+        assert!(config.validate().is_ok());
+
+        config.models.insert(
+            "alias".into(),
+            Model {
+                modelname: Some("  ".into()),
+                ..model.clone()
+            },
+        );
+        assert!(config.validate().is_err());
+
+        config.models.insert(
+            "alias".into(),
+            Model {
+                api_key: Some(String::new()),
+                ..model
+            },
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace_user_key() {
+        let mut config = Config::default();
+        config.users.insert("me".into(), "sk-test key".into());
+        assert!(config.validate().is_err());
+        config.users.insert("me".into(), "sk-test-key".into());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn allows_ipv6_loopback_plaintext_upstream() {
+        let mut config = Config::default();
+        config.models.insert(
+            "local6".into(),
+            Model {
+                endpoint: "http://[::1]:8080/v1".into(),
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_remote_ipv6_plaintext_upstream() {
+        let mut config = Config::default();
+        config.models.insert(
+            "remote6".into(),
+            Model {
+                endpoint: "http://[2001:db8::1]/v1".into(),
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_err());
     }
 
     #[test]

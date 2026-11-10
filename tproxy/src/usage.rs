@@ -118,7 +118,7 @@ impl Usage {
         self.record_at(user, model, now_secs());
     }
 
-    /// Record one forwarded request at a specific time. Exposed for tests.
+    /// Record one forwarded request at a specific time.
     pub fn record_at(&self, user: &str, model: &str, now: u64) {
         let bucket = now / BUCKET_SECS * BUCKET_SECS;
         let mut state = self.lock();
@@ -143,7 +143,7 @@ impl Usage {
         self.snapshot_at(now_secs())
     }
 
-    /// Snapshot the retained history as of a specific time. Exposed for tests.
+    /// Snapshot the retained history as of a specific time.
     pub fn snapshot_at(&self, now: u64) -> Snapshot {
         let state = self.lock();
         let cutoff = now.saturating_sub(RETENTION_SECS);
@@ -517,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_journal_does_not_override_snapshot() {
+    fn journal_replay_uses_latest_entry() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("usage.json");
         let journal = journal_path(&path);

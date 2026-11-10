@@ -93,8 +93,11 @@ impl AppState {
             .filter(|key| !key.is_empty())
             .map(|key| key.as_bytes().to_vec())
             .collect();
-        secrets.sort_by_key(|key| std::cmp::Reverse(key.len()));
+        // Deduplicate identical keys, then redact the longest first so a
+        // shorter key cannot partially mask a longer one.
+        secrets.sort_unstable();
         secrets.dedup();
+        secrets.sort_by_key(|key| std::cmp::Reverse(key.len()));
         let rate_limit = config.server.rate_limit;
         let ip_rate_limit = config.server.ip_rate_limit;
         let max_concurrency = config.server.max_concurrency;

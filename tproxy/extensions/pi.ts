@@ -85,8 +85,8 @@ async function discoverModels(
   if (!response.ok) {
     throw new Error(`GET /models returned ${response.status}`);
   }
-  const payload = (await response.json()) as { data?: unknown };
-  if (!Array.isArray(payload.data)) {
+  const payload = (await response.json()) as { data?: unknown } | null;
+  if (!payload || !Array.isArray(payload.data)) {
     throw new Error("GET /models returned an invalid response");
   }
   return payload.data.map(toModelConfig);

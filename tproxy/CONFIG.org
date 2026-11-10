@@ -77,7 +77,8 @@ JSON =model= field.
 | =input=          | =["text"]= | Inputs: =text= and/or =image=.                 |
 | =cost=           | zero       | Price per million tokens.                      |
 
-Cost fields are =input=, =output=, =cache_read=, and =cache_write=.
+When set, =modelname=, =name=, and =api_key= must be non-empty. Cost fields
+are =input=, =output=, =cache_read=, and =cache_write=.
 =/v1/chat/completions= is forwarded to =ENDPOINT/chat/completions=; the =/v1=
 prefix is stripped and query strings are kept. Endpoints must use HTTP or
 HTTPS, must not contain credentials, and remote plaintext HTTP requires
@@ -89,7 +90,8 @@ startup; restart tproxy after changing models.
 * Users
 
 =users= maps names to API keys. Clients send =Authorization: Bearer <key>=.
-Generate keys with =tproxy useradd alice=.
+Keys must be non-empty and must not contain whitespace. Generate keys with
+=tproxy useradd alice=.
 
 Keys and upstream API keys are stored in plaintext; keep the config private.
 Short keys produce a startup warning.
@@ -106,4 +108,28 @@ requires authentication.
 
 * Pi extension
 
-Pi setup and =models.json= overrides are documented in [[file:README.org][README.org]].
+The extension at [[file:extensions/pi.ts][extensions/pi.ts]] registers a Pi provider named
+=tproxy=. It has no environment-variable configuration and defaults to
+=http://127.0.0.1:8001/v1=. Model IDs, names, capabilities, limits, and costs
+come from =GET /v1/models= through Pi's =refreshModels= hook.
+
+Authenticate with =/login tproxy=, then open =/model= once to trigger
+discovery.
+
+To override the endpoint or provide the key in Pi, add a provider entry to
+=models.json=:
+
+#+begin_src json
+{
+  "providers": {
+    "tproxy": {
+      "baseUrl": "http://127.0.0.1:8001/v1",
+      "apiKey": "sk-...",
+      "api": "openai-completions"
+    }
+  }
+}
+#+end_src
+
+Model metadata is always read from tproxy; the extension has no hardcoded
+model IDs, limits, capabilities, or costs.
