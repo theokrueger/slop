@@ -1,0 +1,17 @@
+[Unit]
+Description=tproxy OpenAI-compatible reverse proxy
+
+[Service]
+Type=simple
+# Relative paths in the config (cert, key, log) resolve from here.
+WorkingDirectory=%h
+# Adjust this path if tproxy is not installed in ~/.cargo/bin.
+# Uses /etc/tproxy.yaml by default; it must be readable by this user.
+ExecStart=%h/.cargo/bin/tproxy serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

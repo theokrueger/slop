@@ -1,11 +1,11 @@
-use crate::config::Config;
+use crate::{config::Config, usage::Usage};
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
     extract::{ConnectInfo, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::StreamExt;
@@ -22,10 +22,12 @@ use tokio::sync::Semaphore;
 
 const MAX_ERROR_BODY_BYTES: usize = 1 << 20;
 const MAX_RATE_KEYS: usize = 100_000;
+const DASHBOARD: &str = include_str!("dashboard.html");
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub usage: Usage,
     client: reqwest::Client,
     keys: Arc<Vec<(String, [u8; 32])>>,
     models: Bytes,
@@ -38,6 +40,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> anyhow::Result<Self> {
+        Self::with_usage(config, Usage::in_memory())
+    }
+
+    pub fn with_usage(config: Config, usage: Usage) -> anyhow::Result<Self> {
         config.validate()?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -95,6 +101,7 @@ impl AppState {
 
         Ok(Self {
             config: Arc::new(config),
+            usage,
             client,
             keys: Arc::new(keys),
             models,
@@ -214,6 +221,8 @@ impl RateLimiter {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(dashboard))
+        .route("/usage.json", get(usage_json))
         .route("/health", get(|| async { "ok" }))
         .route("/v1/models", get(models))
         .route("/v1/{*path}", post(forward))
@@ -234,6 +243,21 @@ async fn security_headers(request: Request, next: Next) -> Response {
         HeaderValue::from_static("no-referrer"),
     );
     response
+}
+
+async fn dashboard() -> Html<&'static str> {
+    Html(DASHBOARD)
+}
+
+async fn usage_json(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let body = serde_json::to_vec(&state.usage.snapshot_now())
+        .map_err(|e| ApiError::internal(format!("serialize usage: {e}")))?;
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
 }
 
 async fn models(
@@ -316,6 +340,7 @@ async fn forward(
         tracing::warn!(user, model = %alias, error = %e.without_url(), "upstream request failed");
         ApiError::bad_gateway("upstream request failed")
     })?;
+    state.usage.record(user, &alias);
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
     tracing::info!(

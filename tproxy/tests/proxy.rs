@@ -209,6 +209,55 @@ async fn lists_configured_models() {
 }
 
 #[tokio::test]
+async fn records_usage_and_serves_dashboard() {
+    let (proxy_addr, _captured) = setup().await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{proxy_addr}/v1/chat/completions");
+
+    for _ in 0..3 {
+        let response = client
+            .post(&url)
+            .bearer_auth("sk-test")
+            .json(&json!({"model": "alias", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "data: {\"ok\":true}\n\n");
+    }
+
+    let usage: Value = client
+        .get(format!("http://{proxy_addr}/usage.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(usage["retention_days"], 30);
+    let recorded = usage["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|bucket| bucket["counts"]["me"]["alias"] == 3);
+    assert!(recorded, "usage should record three requests for me/alias");
+
+    let dashboard = client
+        .get(format!("http://{proxy_addr}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dashboard.status(), 200);
+    assert!(
+        dashboard.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert!(dashboard.text().await.unwrap().contains("tproxy usage"));
+}
+
+#[tokio::test]
 async fn rate_limits_bad_auth_by_ip() {
     let (proxy_addr, _captured) = setup().await;
     let client = reqwest::Client::new();

@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::{
     fs,
     net::SocketAddr,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 use tokio::net::lookup_host;
@@ -10,6 +11,7 @@ use tproxy::{
     cli,
     config::{Config, default_path, warn_if_insecure, warn_if_insecure_key},
     proxy::{self, AppState},
+    usage::Usage,
 };
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
@@ -61,10 +63,16 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(path: &Path) -> Result<()> {
+    refuse_root()?;
+
     let config = Config::load(path)?;
     let _guard = init_logging(config.server.log.as_deref())?;
     warn_if_insecure(path);
-    let state = AppState::new(config.clone())?;
+    let usage_path = tproxy::usage::default_path();
+    tracing::info!(path = %usage_path.display(), "usage data");
+    let usage = Usage::load(usage_path);
+    let state = AppState::with_usage(config.clone(), usage.clone())?;
+    let flush = tokio::spawn(usage.clone().flush_loop());
 
     let port: u16 = config
         .server
@@ -122,9 +130,46 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
 
-    tokio::select! {
-        result = server => result?,
-        _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+    let result = tokio::select! {
+        result = server => result,
+        _ = shutdown() => {
+            tracing::info!("shutting down");
+            Ok(())
+        }
+    };
+
+    flush.abort();
+    let _ = flush.await;
+    if let Err(error) = usage.save() {
+        tracing::warn!(%error, "failed to save usage data");
+    }
+    result
+}
+
+async fn shutdown() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut terminate) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to listen for SIGTERM");
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+fn refuse_root() -> Result<()> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    refuse_uid(unsafe { libc::geteuid() })
+}
+
+fn refuse_uid(uid: libc::uid_t) -> Result<()> {
+    if uid == 0 {
+        bail!("refusing to run as root; run tproxy as an unprivileged user");
     }
     Ok(())
 }
@@ -154,12 +199,8 @@ fn init_logging(path: Option<&Path>) -> Result<Option<WorkerGuard>> {
                 .append(true)
                 .open(path)
                 .with_context(|| format!("open log {}", path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-                    .with_context(|| format!("set permissions on {}", path.display()))?;
-            }
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("set permissions on {}", path.display()))?;
             let (writer, guard) = tracing_appender::non_blocking(file);
             builder.with_writer(writer).with_ansi(false).init();
             Ok(Some(guard))
@@ -174,6 +215,12 @@ fn init_logging(path: Option<&Path>) -> Result<Option<WorkerGuard>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_root_uid() {
+        assert!(refuse_uid(0).is_err());
+        assert!(refuse_uid(1000).is_ok());
+    }
 
     #[test]
     fn refuses_public_plaintext() {

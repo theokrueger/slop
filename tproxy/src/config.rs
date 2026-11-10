@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     fs,
     net::IpAddr,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -272,29 +273,21 @@ impl Config {
         }
         let text = serde_yaml_ng::to_string(self).context("serialize config")?;
         fs::write(path, text).with_context(|| format!("write config {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("set permissions on {}", path.display()))?;
-        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("set permissions on {}", path.display()))?;
         Ok(())
     }
 }
 
-#[cfg(unix)]
 pub fn warn_if_insecure(path: &Path) {
     warn_if_accessible(path, "config file");
 }
 
-#[cfg(unix)]
 pub fn warn_if_insecure_key(path: &Path) {
     warn_if_accessible(path, "TLS private key");
 }
 
-#[cfg(unix)]
 fn warn_if_accessible(path: &Path, kind: &str) {
-    use std::os::unix::fs::PermissionsExt;
     if let Ok(metadata) = fs::metadata(path) {
         let mode = metadata.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
@@ -308,18 +301,8 @@ fn warn_if_accessible(path: &Path, kind: &str) {
     }
 }
 
-#[cfg(not(unix))]
-pub fn warn_if_insecure(_path: &Path) {}
-
-#[cfg(not(unix))]
-pub fn warn_if_insecure_key(_path: &Path) {}
-
 pub fn default_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("tproxy.yaml")
+    PathBuf::from("/etc/tproxy.yaml")
 }
 
 #[cfg(test)]
@@ -356,6 +339,11 @@ users:
             "https://api.morphllm.com/v1"
         );
         assert_eq!(config.users["me"], "API_KEY");
+    }
+
+    #[test]
+    fn default_config_path_is_etc() {
+        assert_eq!(default_path(), Path::new("/etc/tproxy.yaml"));
     }
 
     #[test]
@@ -473,10 +461,8 @@ users: {}
         assert_eq!(Config::load(&path).unwrap().users["me"], "sk-test");
     }
 
-    #[cfg(unix)]
     #[test]
     fn save_sets_private_permissions() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tproxy.yaml");
         Config::default().save(&path).unwrap();

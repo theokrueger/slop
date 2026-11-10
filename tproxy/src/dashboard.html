@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tproxy usage</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f8;
+    --panel: #ffffff;
+    --text: #1c1c1e;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --grid: #e5e7eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111214;
+      --panel: #1a1b1e;
+      --text: #e8e8ea;
+      --muted: #9ca3af;
+      --border: #2a2c31;
+      --grid: #2a2c31;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { max-width: 1200px; margin: 0 auto; padding: 24px 24px 0; }
+  h1 { margin: 0; font-size: 22px; }
+  h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
+  #subtitle { margin: 4px 0 0; color: var(--muted); }
+  main {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 16px 24px 48px;
+    display: grid;
+    gap: 16px;
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+  .controls label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+  select {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font: inherit;
+  }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    min-width: 0;
+  }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 22px; font-weight: 650; margin-top: 2px; overflow-wrap: anywhere; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .chart { position: relative; width: 100%; min-height: 320px; }
+  .chart svg { display: block; width: 100%; height: auto; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { fill: var(--muted); font-size: 11px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 12px; }
+  .legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
+  .muted { color: var(--muted); }
+  .tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+    min-width: 150px;
+    z-index: 2;
+  }
+  .tip-title { font-weight: 600; margin-bottom: 4px; }
+  .tip-row { display: flex; align-items: center; gap: 6px; }
+  .tip-row b { margin-left: auto; padding-left: 12px; }
+  .tip-total { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 4px; display: flex; }
+  .tip-total b { margin-left: auto; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td {
+    text-align: right;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { color: var(--muted); font-weight: 600; }
+  tbody th { font-weight: 500; }
+  tbody tr:last-child th, tbody tr:last-child td { border-bottom: none; }
+  tr.total th, tr.total td { font-weight: 650; }
+  .strong { font-weight: 650; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tproxy usage</h1>
+  <p id="subtitle">Loading usage data…</p>
+</header>
+<main>
+  <section class="controls">
+    <label>Range
+      <select id="range"></select>
+    </label>
+    <label>User
+      <select id="user"><option value="">All users</option></select>
+    </label>
+    <label>Stack by
+      <select id="group">
+        <option value="model">Model</option>
+        <option value="user">User</option>
+      </select>
+    </label>
+  </section>
+
+  <section class="cards" id="cards"></section>
+
+  <section class="panel">
+    <h2 id="chart-title">Requests over time</h2>
+    <div class="chart" id="chart"></div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Totals by user and model</h2>
+    <div class="table-wrap"><table id="totals"></table></div>
+  </section>
+</main>
+<script>
+(() => {
+  "use strict";
+
+  const NS = "http://www.w3.org/2000/svg";
+  const PALETTE = [
+    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948",
+    "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac", "#a0cbe8", "#ffbe7d",
+    "#8cd17d", "#b6992d", "#499894", "#d37295", "#fabfd2", "#86bcb6",
+  ];
+  const HOUR_SECS = 3600;
+  const RANGES = [
+    { label: "24 hours", secs: 86400 },
+    { label: "7 days", secs: 7 * 86400 },
+    { label: "30 days", secs: 30 * 86400 },
+  ];
+  const REFRESH_MS = 60000;
+
+  const state = { data: null, range: RANGES[1].secs, user: "", group: "model" };
+  const colorCache = new Map();
+  const numberFormat = new Intl.NumberFormat();
+  const $ = (id) => document.getElementById(id);
+
+  function formatCount(value) {
+    return numberFormat.format(value);
+  }
+
+  function assignColors(keys) {
+    const colors = new Map();
+    keys.forEach((key, index) => colors.set(key, PALETTE[index % PALETTE.length]));
+    return colors;
+  }
+
+  function colorsFor(kind) {
+    if (colorCache.has(kind)) return colorCache.get(kind);
+    const keys = new Set();
+    for (const bucket of state.data.buckets) {
+      for (const [user, models] of Object.entries(bucket.counts)) {
+        if (kind === "user") {
+          keys.add(user);
+        } else {
+          for (const model of Object.keys(models)) keys.add(model);
+        }
+      }
+    }
+    const colors = assignColors([...keys].sort());
+    colorCache.set(kind, colors);
+    return colors;
+  }
+
+  function seriesKey(user, model) {
+    if (state.user) return model;
+    return state.group === "user" ? user : model;
+  }
+
+  function aggregate() {
+    const size = HOUR_SECS;
+    const now = state.data.generated_at;
+    const end = Math.floor(now / size) * size;
+    const count = Math.max(1, Math.ceil(state.range / size));
+    const start = end - (count - 1) * size;
+
+    const buckets = [];
+    const index = new Map();
+    for (let time = start; time <= end; time += size) {
+      index.set(time, buckets.length);
+      buckets.push({ start: time, counts: new Map() });
+    }
+
+    for (const bucket of state.data.buckets) {
+      const time = Math.floor(bucket.start / size) * size;
+      const at = index.get(time);
+      if (at === undefined) continue;
+      for (const [user, models] of Object.entries(bucket.counts)) {
+        if (state.user && user !== state.user) continue;
+        for (const [model, value] of Object.entries(models)) {
+          const key = seriesKey(user, model);
+          const counts = buckets[at].counts;
+          counts.set(key, (counts.get(key) || 0) + value);
+        }
+      }
+    }
+
+    const keys = new Set();
+    for (const bucket of buckets) for (const key of bucket.counts.keys()) keys.add(key);
+    return { start, end, buckets, series: [...keys].sort() };
+  }
+
+  function rawTotals() {
+    const cutoff = state.data.generated_at - state.range;
+    const perUser = new Map();
+    const models = new Set();
+    let total = 0;
+    for (const bucket of state.data.buckets) {
+      if (bucket.start < cutoff) continue;
+      for (const [user, counts] of Object.entries(bucket.counts)) {
+        let row = perUser.get(user);
+        if (!row) {
+          row = new Map();
+          perUser.set(user, row);
+        }
+        for (const [model, value] of Object.entries(counts)) {
+          row.set(model, (row.get(model) || 0) + value);
+          models.add(model);
+          total += value;
+        }
+      }
+    }
+    return { perUser, models: [...models].sort(), total };
+  }
+
+  function niceTicks(max, count) {
+    if (max <= 0) return { max: 1, ticks: [0, 1] };
+    const raw = max / count;
+    const exponent = Math.floor(Math.log10(raw));
+    const base = Math.pow(10, exponent);
+    const ratio = raw / base;
+    let step = (ratio <= 1 ? 1 : ratio <= 2 ? 2 : ratio <= 5 ? 5 : 10) * base;
+    step = Math.max(1, Math.round(step));
+    const top = Math.ceil(max / step) * step;
+    const ticks = [];
+    for (let value = 0; value <= top; value += step) ticks.push(value);
+    return { max: top, ticks };
+  }
+
+  function formatTime(time) {
+    const date = new Date(time * 1000);
+    if (state.range <= 86400) {
+      return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+    return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" });
+  }
+
+  function svgElement(name, attributes) {
+    const element = document.createElementNS(NS, name);
+    for (const [key, value] of Object.entries(attributes)) {
+      element.setAttribute(key, value);
+    }
+    return element;
+  }
+
+  function addLine(svg, x1, y1, x2, y2, className) {
+    svg.appendChild(svgElement("line", { x1, y1, x2, y2, class: className }));
+  }
+
+  function addText(svg, x, y, value, className, anchor) {
+    const element = svgElement("text", { x, y, class: className, "text-anchor": anchor });
+    element.textContent = value;
+    svg.appendChild(element);
+  }
+
+  function addRect(svg, x, y, width, height, fill) {
+    svg.appendChild(svgElement("rect", { x, y, width, height, fill }));
+  }
+
+  function renderCards(totals) {
+    const perModel = new Map();
+    for (const row of totals.perUser.values()) {
+      for (const [model, value] of row) {
+        perModel.set(model, (perModel.get(model) || 0) + value);
+      }
+    }
+    let topModel = "—";
+    let topCount = 0;
+    for (const [model, value] of perModel) {
+      if (value > topCount) {
+        topModel = model;
+        topCount = value;
+      }
+    }
+    const cards = [
+      ["Requests", formatCount(totals.total)],
+      ["Active users", formatCount(totals.perUser.size)],
+      ["Models used", formatCount(totals.models.length)],
+      ["Top model", topCount ? `${topModel} (${formatCount(topCount)})` : "—"],
+    ];
+    const container = $("cards");
+    container.replaceChildren();
+    for (const [label, value] of cards) {
+      const card = document.createElement("div");
+      card.className = "card";
+      const labelElement = document.createElement("div");
+      labelElement.className = "label";
+      labelElement.textContent = label;
+      const valueElement = document.createElement("div");
+      valueElement.className = "value";
+      valueElement.textContent = value;
+      card.append(labelElement, valueElement);
+      container.append(card);
+    }
+  }
+
+  function renderChart(agg) {
+    const chart = $("chart");
+    const legend = $("legend");
+    chart.replaceChildren();
+    legend.replaceChildren();
+
+    const totals = agg.buckets.map((bucket) =>
+      [...bucket.counts.values()].reduce((sum, value) => sum + value, 0));
+    const max = Math.max(0, ...totals);
+    if (max === 0) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No usage recorded in this range.";
+      chart.append(empty);
+      return;
+    }
+
+    const width = Math.max(320, chart.clientWidth || 800);
+    const height = 320;
+    const margin = { top: 16, right: 16, bottom: 34, left: 52 };
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    const { max: yMax, ticks } = niceTicks(max, 4);
+    const y = (value) => margin.top + plotHeight - (value / yMax) * plotHeight;
+    const band = plotWidth / agg.buckets.length;
+    const barWidth = Math.max(1, Math.min(48, band * 0.85));
+
+    const colorKind = state.user || state.group === "model" ? "model" : "user";
+    const colors = colorsFor(colorKind);
+    const color = (key) => colors.get(key) || "#888888";
+
+    const svg = svgElement("svg", {
+      viewBox: `0 0 ${width} ${height}`,
+      width: "100%",
+      height,
+      role: "img",
+      "aria-label": "Requests over time",
+    });
+
+    for (const tick of ticks) {
+      const yy = y(tick);
+      addLine(svg, margin.left, yy, margin.left + plotWidth, yy, "grid");
+      addText(svg, margin.left - 8, yy + 4, formatCount(tick), "axis", "end");
+    }
+
+    agg.buckets.forEach((bucket, index) => {
+      const x = margin.left + index * band + (band - barWidth) / 2;
+      let stacked = 0;
+      for (const key of agg.series) {
+        const value = bucket.counts.get(key) || 0;
+        if (!value) continue;
+        const yTop = y(stacked + value);
+        const yBottom = y(stacked);
+        addRect(svg, x, yTop, barWidth, yBottom - yTop, color(key));
+        stacked += value;
+      }
+    });
+
+    const labelEvery = Math.max(1, Math.ceil(agg.buckets.length / 6));
+    agg.buckets.forEach((bucket, index) => {
+      if (index % labelEvery !== 0 && index !== agg.buckets.length - 1) return;
+      addText(
+        svg,
+        margin.left + index * band + band / 2,
+        height - 10,
+        formatTime(bucket.start),
+        "axis",
+        "middle",
+      );
+    });
+
+    chart.appendChild(svg);
+
+    for (const key of agg.series) {
+      const total = agg.buckets.reduce(
+        (sum, bucket) => sum + (bucket.counts.get(key) || 0), 0);
+      const item = document.createElement("span");
+      item.className = "legend-item";
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.background = color(key);
+      const name = document.createElement("span");
+      name.textContent = key;
+      const count = document.createElement("span");
+      count.className = "muted";
+      count.textContent = formatCount(total);
+      item.append(swatch, name, document.createTextNode(" "), count);
+      legend.append(item);
+    }
+
+    const tooltip = document.createElement("div");
+    tooltip.className = "tooltip";
+    tooltip.hidden = true;
+    chart.appendChild(tooltip);
+
+    svg.addEventListener("mousemove", (event) => {
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width) return;
+      const x = (event.clientX - rect.left) * (width / rect.width);
+      const index = Math.floor((x - margin.left) / band);
+      if (index < 0 || index >= agg.buckets.length) {
+        tooltip.hidden = true;
+        return;
+      }
+      const bucket = agg.buckets[index];
+      const rows = agg.series
+        .map((key) => [key, bucket.counts.get(key) || 0])
+        .filter(([, value]) => value > 0);
+      if (!rows.length) {
+        tooltip.hidden = true;
+        return;
+      }
+      const total = rows.reduce((sum, [, value]) => sum + value, 0);
+      tooltip.replaceChildren();
+      const title = document.createElement("div");
+      title.className = "tip-title";
+      title.textContent = formatTime(bucket.start);
+      tooltip.append(title);
+      for (const [key, value] of rows) {
+        const row = document.createElement("div");
+        row.className = "tip-row";
+        const swatch = document.createElement("span");
+        swatch.className = "swatch";
+        swatch.style.background = color(key);
+        const name = document.createElement("span");
+        name.textContent = key;
+        const bold = document.createElement("b");
+        bold.textContent = formatCount(value);
+        row.append(swatch, name, bold);
+        tooltip.append(row);
+      }
+      const totalRow = document.createElement("div");
+      totalRow.className = "tip-total";
+      totalRow.append(document.createTextNode("Total"));
+      const totalBold = document.createElement("b");
+      totalBold.textContent = formatCount(total);
+      totalRow.append(totalBold);
+      tooltip.append(totalRow);
+      tooltip.hidden = false;
+      const left = Math.min(
+        Math.max(8, event.clientX - rect.left + 12),
+        Math.max(8, rect.width - tooltip.offsetWidth - 8),
+      );
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${Math.max(8, event.clientY - rect.top - 12)}px`;
+    });
+
+    svg.addEventListener("mouseleave", () => {
+      tooltip.hidden = true;
+    });
+  }
+
+  function cell(text, className) {
+    const element = document.createElement("td");
+    if (className) element.className = className;
+    element.textContent = text;
+    return element;
+  }
+
+  function renderTable(totals) {
+    const table = $("totals");
+    table.replaceChildren();
+
+    if (!totals.perUser.size) {
+      const tbody = document.createElement("tbody");
+      const row = document.createElement("tr");
+      row.append(cell("No usage recorded in this range.", "empty"));
+      tbody.append(row);
+      table.append(tbody);
+      return;
+    }
+
+    const users = [...totals.perUser.keys()].sort();
+    const columns = totals.models;
+    const columnTotals = new Map(columns.map((model) => [model, 0]));
+
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    const userHead = document.createElement("th");
+    userHead.textContent = "User";
+    headRow.append(userHead);
+    for (const model of columns) {
+      const head = document.createElement("th");
+      head.textContent = model;
+      headRow.append(head);
+    }
+    const totalHead = document.createElement("th");
+    totalHead.textContent = "Total";
+    headRow.append(totalHead);
+    thead.append(headRow);
+    table.append(thead);
+
+    const tbody = document.createElement("tbody");
+    for (const user of users) {
+      const row = totals.perUser.get(user);
+      let rowTotal = 0;
+      const tr = document.createElement("tr");
+      const head = document.createElement("th");
+      head.scope = "row";
+      head.textContent = user;
+      tr.append(head);
+      for (const model of columns) {
+        const value = row.get(model) || 0;
+        rowTotal += value;
+        columnTotals.set(model, columnTotals.get(model) + value);
+        tr.append(cell(formatCount(value), value ? "" : "muted"));
+      }
+      tr.append(cell(formatCount(rowTotal), "strong"));
+      tbody.append(tr);
+    }
+
+    const totalRow = document.createElement("tr");
+    totalRow.className = "total";
+    const allHead = document.createElement("th");
+    allHead.scope = "row";
+    allHead.textContent = "All users";
+    totalRow.append(allHead);
+    for (const model of columns) {
+      totalRow.append(cell(formatCount(columnTotals.get(model))));
+    }
+    totalRow.append(cell(formatCount(totals.total)));
+    tbody.append(totalRow);
+    table.append(tbody);
+  }
+
+  function syncGroup() {
+    const group = $("group");
+    group.disabled = Boolean(state.user);
+    if (state.user) {
+      group.value = "model";
+      state.group = "model";
+    }
+  }
+
+  function render() {
+    if (!state.data) return;
+    const agg = aggregate();
+    const totals = rawTotals();
+    renderCards(totals);
+    renderChart(agg);
+    renderTable(totals);
+    const who = state.user || "all users";
+    const by = state.user ? "model" : state.group;
+    $("chart-title").textContent = `Requests over time — ${who}, stacked by ${by}`;
+  }
+
+  function fillUsers() {
+    const users = new Set();
+    for (const bucket of state.data.buckets) {
+      for (const user of Object.keys(bucket.counts)) users.add(user);
+    }
+    if (state.user && !users.has(state.user)) state.user = "";
+    const select = $("user");
+    select.replaceChildren();
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All users";
+    select.append(all);
+    for (const user of [...users].sort()) {
+      const option = document.createElement("option");
+      option.value = user;
+      option.textContent = user;
+      select.append(option);
+    }
+    select.value = state.user;
+    syncGroup();
+  }
+
+  async function load() {
+    try {
+      const response = await fetch("usage.json", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      state.data = await response.json();
+      colorCache.clear();
+      fillUsers();
+      const updated = new Date(state.data.generated_at * 1000).toLocaleString();
+      $("subtitle").textContent =
+        `Retention ${state.data.retention_days} days · hourly bins · updated ${updated}`;
+      render();
+    } catch (error) {
+      $("subtitle").textContent = `Failed to load usage data: ${error.message}`;
+    }
+  }
+
+  function init() {
+    const rangeSelect = $("range");
+    for (const range of RANGES) {
+      const option = document.createElement("option");
+      option.value = String(range.secs);
+      option.textContent = range.label;
+      if (range.secs === state.range) option.selected = true;
+      rangeSelect.appendChild(option);
+    }
+    rangeSelect.addEventListener("change", () => {
+      state.range = Number(rangeSelect.value);
+      render();
+    });
+    $("user").addEventListener("change", (event) => {
+      state.user = event.target.value;
+      syncGroup();
+      render();
+    });
+    $("group").addEventListener("change", (event) => {
+      state.group = event.target.value;
+      render();
+    });
+    syncGroup();
+    load();
+    setInterval(() => {
+      if (document.visibilityState === "visible") load();
+    }, REFRESH_MS);
+    let resizeTimer;
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (state.data) render();
+      }, 150);
+    });
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
