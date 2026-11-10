@@ -1,0 +1,154 @@
+#+title: tproxy configuration
+#+description: Configuration reference for tproxy
+
+* File location
+
+Default: =~/.config/tproxy.yaml= or =$XDG_CONFIG_HOME/tproxy.yaml=.
+Override with =--config FILE= or =-c FILE=.
+
+The file is YAML. =tproxy useradd= and =tproxy modeladd= rewrite it; comments
+and custom formatting are not preserved.
+
+* Example
+
+#+begin_src yaml
+server:
+  host: "127.0.0.1"
+  port: "8001"
+  cert: "/path/to/cert"
+  key: "/path/to/key"
+  log: "/path/to/log"
+  rate_limit: 100
+  ip_rate_limit: 300
+  max_concurrency: 128
+  allow_insecure: false
+  allow_insecure_upstream: false
+  max_body_bytes: 16777216
+  body_timeout_secs: 30
+  upstream_read_timeout_secs: 300
+  allowed_paths:
+    - "/v1/chat/completions"
+    - "/v1/completions"
+    - "/v1/embeddings"
+    - "/v1/responses"
+
+models:
+  "morph-dsv41flash-1017":
+    endpoint: "https://api.morphllm.com/v1"
+    modelname: "morph-dsv41flash-1017"
+    api_key: "morph-api-key"
+    name: "Morph DeepSeek V4.1 Flash"
+    context_window: 128000
+    max_tokens: 16384
+    reasoning: false
+    input: ["text"]
+    cost:
+      input: 0
+      output: 0
+      cache_read: 0
+      cache_write: 0
+
+users:
+  me: "sk-..."
+#+end_src
+
+* Server
+
+| Field                        | Default                  | Description                                             |
+|------------------------------+--------------------------+---------------------------------------------------------|
+| =host=                       | =127.0.0.1=              | Bind address.                                           |
+| =port=                       | ="8001"=                 | Bind port.                                              |
+| =cert= / =key=               | unset                    | Enable HTTPS. Both must be set together.                |
+| =log=                        | unset                    | Append log file. Logs go to stdout when omitted.        |
+| =rate_limit=                 | =100=                    | Requests/minute per user or bad-auth source IP.         |
+| =ip_rate_limit=              | =300=                    | All requests/minute per source IP.                      |
+| =max_concurrency=            | =128=                    | In-flight forwarded requests before returning 503.      |
+| =allow_insecure=             | =false=                  | Permit plaintext HTTP on a non-loopback address.        |
+| =allow_insecure_upstream=    | =false=                  | Permit remote plaintext HTTP upstream endpoints.        |
+| =max_body_bytes=             | =16777216=               | Maximum client request body size.                       |
+| =body_timeout_secs=          | =30=                     | Time allowed to read the client request body.           |
+| =upstream_read_timeout_secs= | =300=                    | Upstream response read timeout.                         |
+| =allowed_paths=              | inference endpoints      | Exact POST paths clients may forward.                   |
+
+A =rate_limit= or =ip_rate_limit= of =0= disables that limiter. Rate limits use
+in-memory token buckets. The source IP is the direct peer address;
+=X-Forwarded-For= is not trusted.
+
+Default =allowed_paths=:
+
+#+begin_src yaml
+- "/v1/chat/completions"
+- "/v1/completions"
+- "/v1/embeddings"
+- "/v1/responses"
+#+end_src
+
+On Unix, config and log files are restricted to mode =0600=. tproxy warns when
+an existing config is accessible by other users or when a TLS private key is
+not private.
+
+* Models
+
+Keys under =models:= are client-facing aliases. Clients send the alias in the
+JSON =model= field.
+
+| Field            | Default        | Description                                      |
+|------------------+----------------+--------------------------------------------------|
+| =endpoint=       | required       | Upstream API prefix, normally ending in =/v1=.   |
+| =modelname=      | alias          | Model name sent to the upstream.                 |
+| =api_key=        | unset          | Upstream bearer token.                           |
+| =name=           | alias          | Display name returned by =GET /v1/models=.       |
+| =context_window= | =128000=       | Context window in tokens.                        |
+| =max_tokens=     | =16384=        | Maximum output tokens.                           |
+| =reasoning=      | =false=        | Whether the model supports reasoning.            |
+| =input=          | =["text"]=     | Supported inputs: =text= and/or =image=.         |
+| =cost=           | zero           | Pricing per million tokens.                      |
+
+Cost fields are =input=, =output=, =cache_read=, and =cache_write=.
+
+Request =/v1/chat/completions= is forwarded to
+=ENDPOINT/chat/completions=; the =/v1= prefix is removed. Query strings are
+preserved. Endpoints must use HTTP or HTTPS and must not contain credentials.
+Remote plaintext HTTP requires =allow_insecure_upstream: true=.
+
+Model metadata is exposed by =GET /v1/models= as =name=, =reasoning=,
+=input=, =contextWindow=, =maxTokens=, and =cost= (=cacheRead= and
+=cacheWrite=). The model list is built once at server start; restart tproxy
+after changing models.
+
+* Users
+
+=users= maps names to API keys. Clients authenticate with
+=Authorization: Bearer <key>=. Generate keys with:
+
+#+begin_src sh
+tproxy useradd alice
+#+end_src
+
+Keys and upstream API keys are stored in plaintext in the config. Keep the
+config private. Short user keys produce a startup warning.
+
+* Pi extension
+
+The Pi extension has no environment-variable configuration. It defaults to
+=http://127.0.0.1:8001/v1= and fetches models and metadata from
+=GET /v1/models= through Pi's =refreshModels= hook.
+
+Authenticate with =/login tproxy=, then open =/model= once to trigger
+discovery. To override the endpoint or provide the key in Pi, use
+=models.json=:
+
+#+begin_src json
+{
+  "providers": {
+    "tproxy": {
+      "baseUrl": "http://127.0.0.1:8001/v1",
+      "apiKey": "sk-...",
+      "api": "openai-completions"
+    }
+  }
+}
+#+end_src
+
+Model metadata is read from tproxy; the extension has no hardcoded model IDs,
+limits, capabilities, or costs.

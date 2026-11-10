@@ -1,0 +1,105 @@
+#+title: tproxy
+#+description: A small OpenAI-compatible reverse proxy
+
+tproxy exposes one OpenAI-compatible API and forwards each request to the
+upstream configured for the requested model. Clients select a model by its
+alias; tproxy authenticates the client, rewrites the model name, adds the
+upstream API key, and streams the response back.
+
+* Install
+
+#+begin_src sh
+cargo install --path .
+tproxy --help
+#+end_src
+
+* Configuration
+
+See [[file:CONFIG.org][CONFIG.org]] for the configuration file, server
+options, model metadata, users, and defaults.
+
+* CLI
+
+#+begin_src sh
+tproxy                                  # serve using the default config
+tproxy -c FILE serve                    # serve using FILE
+tproxy useradd alice                    # add user, print generated API key
+tproxy modeladd                         # interactively add a model
+#+end_src
+
+=useradd= and =modeladd= read and rewrite the config file. Comments and
+custom formatting in an existing YAML file are not preserved.
+
+* API
+
+Requests must send =Authorization: Bearer <user API key>=. Requests are rate
+limited per user, per source IP, and per invalid-auth source IP using token
+buckets. Excess requests return =429= with =Retry-After=. The source IP is the
+direct peer address; =X-Forwarded-For= is not trusted.
+
+Forwarded requests are also capped by a concurrency limit. When full, tproxy
+returns =503= with =Retry-After: 1= instead of queueing more work.
+
+| Endpoint                | Behavior                                      |
+|-------------------------+-----------------------------------------------|
+| =GET /health=           | Unauthenticated health check, returns =ok=.   |
+| =GET /v1/models=        | Lists aliases and model metadata.              |
+| =POST /v1/{path}=       | Forwards if the exact path is allowed.        |
+
+The model list is built once when the server starts. Restart tproxy after
+changing models. Only =POST= requests to configured allowed paths are
+forwarded. A JSON body with a top-level =model= field is required, and
+streaming responses are passed through unchanged.
+
+Upstream status codes and error responses are passed through, except that
+configured upstream API keys are redacted from error bodies, auth-like and
+cookie response headers are stripped, redirects are refused, and path
+traversal is rejected. The =model= field in the upstream response is not
+rewritten back to the alias.
+
+* Public deployment
+
+For public exposure:
+
+- Use TLS directly, or bind to loopback and terminate TLS in a reverse proxy.
+  Plaintext HTTP on a non-loopback address is refused unless explicitly
+  allowed.
+- Keep the config and log files private. tproxy writes both as mode =0600= on
+  Unix and warns if the config is accessible by other users.
+- Keep allowed paths minimal. Only enable the endpoints your clients need.
+- Use the generated keys from =tproxy useradd=. Short user keys produce a
+  startup warning.
+- Remote upstream connections must use HTTPS. Loopback HTTP upstreams are
+  allowed unless explicitly overridden.
+- Restrict the listening port with a firewall. Rate limiting uses the direct
+  peer IP; behind a reverse proxy, all clients appear as the proxy IP.
+- Tune rate limits and concurrency in [[file:CONFIG.org][CONFIG.org]]. Rate-limit
+  state is in-memory and resets on restart.
+- Upstream API keys are stored in plaintext in the config. Restrict filesystem
+  access and back up the config securely.
+- Client headers are not forwarded except =accept=, =idempotency-key=, and
+  =openai-beta=. The proxy sets =content-type: application/json= itself.
+- Request body size, body timeout, and upstream read timeout are configurable.
+
+* Pi extension
+
+The extension at =extensions/pi.ts= registers a Pi provider named =tproxy=.
+It has no environment-variable configuration. The endpoint defaults to
+=http://127.0.0.1:8001/v1= and both the model list and all model metadata come
+from =GET /v1/models= through Pi's =refreshModels= hook. The extension has no
+hardcoded model IDs, limits, capabilities, or costs.
+
+#+begin_src sh
+pi -e ./extensions/pi.ts
+#+end_src
+
+Authenticate with =/login tproxy=, then open =/model= once to trigger
+discovery. See [[file:CONFIG.org][CONFIG.org]] for Pi =models.json= overrides. The same
+extension file is also available at the originally requested path,
+=exensions/pi.ts=.
+
+* Tests
+
+#+begin_src sh
+cargo test
+#+end_src
