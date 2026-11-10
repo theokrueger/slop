@@ -317,10 +317,15 @@ fn journal_path(path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn append_journal(path: &Path, data: &[u8]) -> Result<()> {
+fn create_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
+    Ok(())
+}
+
+fn append_journal(path: &Path, data: &[u8]) -> Result<()> {
+    create_parent(path)?;
     let before = fs::metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -363,9 +368,7 @@ fn ends_with_newline(path: &Path, len: u64) -> bool {
 }
 
 fn truncate_journal(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
+    create_parent(path)?;
     let file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -379,9 +382,7 @@ fn truncate_journal(path: &Path) -> Result<()> {
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
+    create_parent(path)?;
     let tmp = path.with_extension("json.tmp");
     let mut file = fs::OpenOptions::new()
         .write(true)

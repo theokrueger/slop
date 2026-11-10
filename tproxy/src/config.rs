@@ -21,27 +21,10 @@ pub struct Config {
 pub struct Server {
     pub host: String,
     pub port: String,
-    pub cert: Option<PathBuf>,
-    pub key: Option<PathBuf>,
     pub log: Option<PathBuf>,
     pub rate_limit: u32,
-    pub ip_rate_limit: u32,
     pub max_concurrency: usize,
-    pub allowed_paths: Vec<String>,
-    pub max_body_bytes: usize,
-    pub body_timeout_secs: u64,
-    pub upstream_read_timeout_secs: u64,
-    pub allow_insecure: bool,
     pub allow_insecure_upstream: bool,
-}
-
-fn default_allowed_paths() -> Vec<String> {
-    vec![
-        "/v1/chat/completions".into(),
-        "/v1/completions".into(),
-        "/v1/embeddings".into(),
-        "/v1/responses".into(),
-    ]
 }
 
 impl Default for Server {
@@ -49,17 +32,9 @@ impl Default for Server {
         Self {
             host: "127.0.0.1".into(),
             port: "8001".into(),
-            cert: None,
-            key: None,
             log: None,
             rate_limit: 100,
-            ip_rate_limit: 300,
             max_concurrency: 128,
-            allowed_paths: default_allowed_paths(),
-            max_body_bytes: 16 << 20,
-            body_timeout_secs: 30,
-            upstream_read_timeout_secs: 300,
-            allow_insecure: false,
             allow_insecure_upstream: false,
         }
     }
@@ -174,33 +149,8 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.server.cert.is_some() != self.server.key.is_some() {
-            bail!("server.cert and server.key must be set together");
-        }
-        if self.server.max_body_bytes == 0 {
-            bail!("server.max_body_bytes must be greater than zero");
-        }
-        if self.server.body_timeout_secs == 0 {
-            bail!("server.body_timeout_secs must be greater than zero");
-        }
-        if self.server.upstream_read_timeout_secs == 0 {
-            bail!("server.upstream_read_timeout_secs must be greater than zero");
-        }
         if self.server.max_concurrency == 0 {
             bail!("server.max_concurrency must be greater than zero");
-        }
-        if self.server.allowed_paths.is_empty() {
-            bail!("server.allowed_paths cannot be empty");
-        }
-        for path in &self.server.allowed_paths {
-            if !path.starts_with("/v1/")
-                || path.contains("..")
-                || path.contains(['?', '#', '\\'])
-                || path.to_ascii_lowercase().contains("%2e")
-                || path.chars().any(char::is_whitespace)
-            {
-                bail!("invalid server.allowed_paths entry {path:?}");
-            }
         }
         for (alias, model) in &self.models {
             if alias.trim().is_empty() {
@@ -302,29 +252,29 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 pub fn warn_if_insecure(path: &Path) {
-    warn_if_accessible(path, "config file");
-}
-
-pub fn warn_if_insecure_key(path: &Path) {
-    warn_if_accessible(path, "TLS private key");
-}
-
-fn warn_if_accessible(path: &Path, kind: &str) {
     if let Ok(metadata) = fs::metadata(path) {
         let mode = metadata.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             tracing::warn!(
                 path = %path.display(),
                 mode = format!("{mode:o}"),
-                kind,
-                "file is accessible by other users"
+                "config file is accessible by other users"
             );
         }
     }
 }
 
 pub fn default_path() -> PathBuf {
-    PathBuf::from("/etc/tproxy.yaml")
+    config_dir(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+    .join("tproxy.yaml")
+}
+
+fn config_dir(xdg: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    xdg.or_else(|| home.map(|home| home.join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]
@@ -338,8 +288,6 @@ mod tests {
 server:
   host: "0.0.0.0"
   port: "8001"
-  cert: "/path/to/cert"
-  key: "/path/to/key"
   log: "/path/to/log"
 
 models:
@@ -355,7 +303,6 @@ users:
         .unwrap();
 
         assert_eq!(config.server.port, "8001");
-        assert_eq!(config.server.cert.unwrap(), Path::new("/path/to/cert"));
         assert_eq!(
             config.models["morph-dsv41flash-1017"].endpoint,
             "https://api.morphllm.com/v1"
@@ -364,8 +311,25 @@ users:
     }
 
     #[test]
-    fn default_config_path_is_etc() {
-        assert_eq!(default_path(), Path::new("/etc/tproxy.yaml"));
+    fn default_config_path_uses_xdg_config_home() {
+        assert_eq!(
+            config_dir(Some("/tmp/xdg".into()), Some("/home/me".into())).join("tproxy.yaml"),
+            Path::new("/tmp/xdg/tproxy.yaml")
+        );
+        assert_eq!(
+            config_dir(None, Some("/home/me".into())).join("tproxy.yaml"),
+            Path::new("/home/me/.config/tproxy.yaml")
+        );
+        assert_eq!(
+            config_dir(None, None).join("tproxy.yaml"),
+            Path::new("./tproxy.yaml")
+        );
+    }
+
+    #[test]
+    fn empty_config_uses_defaults() {
+        let config: Config = serde_yaml_ng::from_str("").unwrap();
+        assert_eq!(config.server.host, "127.0.0.1");
     }
 
     #[test]
@@ -374,26 +338,16 @@ users:
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, "8001");
         assert_eq!(config.server.rate_limit, 100);
-        assert_eq!(config.server.ip_rate_limit, 300);
         assert_eq!(config.server.max_concurrency, 128);
-        assert_eq!(config.server.max_body_bytes, 16 << 20);
-        assert_eq!(config.server.allowed_paths, default_allowed_paths());
-        assert!(config.server.cert.is_none());
+        assert!(!config.server.allow_insecure_upstream);
         assert!(config.users.is_empty());
     }
 
     #[test]
-    fn rejects_unsafe_paths_and_incomplete_tls() {
+    fn rejects_zero_concurrency() {
         let mut config = Config::default();
-        config.server.cert = Some("/tmp/cert".into());
+        config.server.max_concurrency = 0;
         assert!(config.validate().is_err());
-
-        config.server.cert = None;
-        config.server.allowed_paths = vec!["/v1/../admin".into()];
-        assert!(config.validate().is_err());
-
-        config.server.allowed_paths = vec!["/v1/chat/completions".into()];
-        assert!(config.validate().is_ok());
     }
 
     #[test]

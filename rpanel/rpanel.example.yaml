@@ -1,0 +1,44 @@
+# rpanel example configuration.
+# Copy to ~/.config/rpanel.yaml (or pass --config).
+
+server:
+  # Append logs here. Omit to log to stdout.
+  log: "/var/log/rpanel.log"
+  host: 127.0.0.1
+  port: 80
+  # Serve plain HTTP. When false, cert and key are required.
+  allow_insecure: false
+  cert: "/etc/rpanel/cert.pem"
+  key: "/etc/rpanel/key.pem"
+
+panel:
+  enable: true
+  # Reload the page every N seconds. 0 disables automatic refresh.
+  refresh_seconds: 10
+  status:
+    storage: true
+    ram: true
+    uptime: true
+    network: true
+    # Plain strings are system units. Use { name, user: true } for user units.
+    status:
+      - tary
+      - name_api_thing
+      # - name: my-user-service
+      #   user: true
+  links:
+    Tary: "/tary"
+    Name: "/name"
+
+groups:
+  "Name":
+    host: "127.0.0.1:8080"
+    https: false
+    paths:
+      "/": "/name"
+      "/api/*": "/nameapi/v1/*"
+  "Tary":
+    host: "cow.local:3001"
+    https: false
+    paths:
+      "/*": "/tary/*"

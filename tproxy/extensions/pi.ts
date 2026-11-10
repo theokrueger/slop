@@ -94,7 +94,7 @@ async function discoverModels(
 
 export default function (pi: ExtensionAPI) {
   const config: ProviderConfig = {
-    name: "tproxy",
+    name: PROVIDER,
     baseUrl: BASE_URL,
     api: "openai-completions",
     async refreshModels(context) {

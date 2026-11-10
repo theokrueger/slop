@@ -3,14 +3,15 @@
 
 * File location
 
-Default: =/etc/tproxy.yaml=. Override with =--config FILE= or =-c FILE=.
+Default: =~/.config/tproxy.yaml= (or =$XDG_CONFIG_HOME/tproxy.yaml=). Override
+with =--config FILE= or =-c FILE=.
 
 The file is YAML and is rewritten by =tproxy useradd= and =tproxy modeladd=;
-comments and formatting are not preserved. The default path is normally
-root-only, so create it as the account that runs tproxy:
+comments and formatting are not preserved. Create it once:
 
 #+begin_src sh
-sudo install -m 600 -o "$USER" -g "$(id -gn)" /dev/null /etc/tproxy.yaml
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}"
+touch "${XDG_CONFIG_HOME:-$HOME/.config}/tproxy.yaml"
 #+end_src
 
 * Example
@@ -19,8 +20,6 @@ sudo install -m 600 -o "$USER" -g "$(id -gn)" /dev/null /etc/tproxy.yaml
 server:
   host: "127.0.0.1"
   port: "8001"
-  cert: "/path/to/cert"
-  key: "/path/to/key"
 
 models:
   "my-model":
@@ -36,29 +35,20 @@ users:
 
 * Server
 
-| Field                        | Default         | Description                                     |
-|------------------------------+-----------------+-------------------------------------------------|
-| =host=                       | =127.0.0.1=     | Bind address.                                   |
-| =port=                       | ="8001"=        | Bind port.                                      |
-| =cert= / =key=               | unset           | Enable HTTPS; both must be set.                 |
-| =log=                        | unset           | Append log file; stdout when omitted.           |
-| =rate_limit=                 | =100=           | Requests/minute per user or bad-auth IP.        |
-| =ip_rate_limit=              | =300=           | Requests/minute per source IP.                  |
-| =max_concurrency=            | =128=           | In-flight requests before =503=.                |
-| =allow_insecure=             | =false=         | Allow plaintext HTTP on non-loopback addresses. |
-| =allow_insecure_upstream=    | =false=         | Allow remote plaintext HTTP upstreams.          |
-| =max_body_bytes=             | =16777216=      | Maximum request body size.                      |
-| =body_timeout_secs=          | =30=            | Request body read timeout.                      |
-| =upstream_read_timeout_secs= | =300=           | Upstream response read timeout.                 |
-| =allowed_paths=              | inference paths | Exact =POST= paths that may be forwarded.       |
+| Field                     | Default     | Description                            |
+|---------------------------+-------------+----------------------------------------|
+| =host=                    | =127.0.0.1= | Bind address.                          |
+| =port=                    | ="8001"=    | Bind port.                             |
+| =log=                     | unset       | Append log file; stdout when omitted.  |
+| =rate_limit=              | =100=       | Requests/minute per user.              |
+| =max_concurrency=         | =128=       | In-flight requests before =503=.       |
+| =allow_insecure_upstream= | =false=     | Allow remote plaintext HTTP upstreams. |
 
-A =rate_limit= or =ip_rate_limit= of =0= disables that limiter. The source IP
-is the direct peer address; =X-Forwarded-For= is not trusted. Default
-=allowed_paths= are =/v1/chat/completions=, =/v1/completions=,
-=/v1/embeddings=, and =/v1/responses=.
+A =rate_limit= of =0= disables the per-user limiter. Rate limits use in-memory
+token buckets.
 
 Config and log files are written with mode =0600=. tproxy warns if the config
-is group/world-accessible or the TLS key is not private.
+is group/world-accessible.
 
 * Models
 

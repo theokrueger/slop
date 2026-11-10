@@ -47,14 +47,7 @@ async fn leaky(headers: HeaderMap) -> Response {
 async fn spawn(app: Router) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap()
-    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     addr
 }
 
@@ -68,6 +61,7 @@ async fn setup_with(
     let (tx, rx) = mpsc::unbounded_channel();
     let upstream = Router::new()
         .route("/v1/chat/completions", post(capture))
+        .route("/v1/echo", post(capture))
         .route("/v1/error", post(leaky))
         .with_state(Capture(tx));
     let upstream_addr = spawn(upstream).await;
@@ -86,7 +80,6 @@ async fn setup_with(
         },
     );
     config.users.insert("me".into(), "sk-test".into());
-    config.server.allowed_paths.push("/v1/error".into());
     configure(&mut config);
     let proxy_addr = spawn(proxy::router(AppState::new(config).unwrap())).await;
     (proxy_addr, rx)
@@ -138,19 +131,19 @@ async fn serves_health_without_auth() {
 }
 
 #[tokio::test]
-async fn rejects_disallowed_paths_and_methods() {
+async fn forwards_any_v1_path_and_rejects_other_methods() {
     let (proxy_addr, _captured) = setup().await;
     let client = reqwest::Client::new();
     let body = json!({"model": "alias"});
 
-    let path = client
-        .post(format!("http://{proxy_addr}/v1/admin"))
+    let forwarded = client
+        .post(format!("http://{proxy_addr}/v1/echo"))
         .bearer_auth("sk-test")
         .json(&body)
         .send()
         .await
         .unwrap();
-    assert_eq!(path.status(), 404);
+    assert_eq!(forwarded.status(), 200);
 
     let method = client
         .get(format!("http://{proxy_addr}/v1/chat/completions"))
@@ -275,31 +268,6 @@ async fn records_usage_and_serves_dashboard() {
             .starts_with("text/html")
     );
     assert!(dashboard.text().await.unwrap().contains("tproxy usage"));
-}
-
-#[tokio::test]
-async fn rate_limits_bad_auth_by_ip() {
-    const LIMIT: u32 = 5;
-    let (proxy_addr, _captured) = setup_with(|config| config.server.rate_limit = LIMIT).await;
-    let client = reqwest::Client::new();
-    let url = format!("http://{proxy_addr}/v1/models");
-
-    for _ in 0..LIMIT {
-        let response = client.get(&url).bearer_auth("wrong").send().await.unwrap();
-        assert_eq!(response.status(), 401);
-    }
-
-    let limited = client.get(&url).bearer_auth("wrong").send().await.unwrap();
-    assert_eq!(limited.status(), 429);
-    assert!(limited.headers().contains_key(header::RETRY_AFTER));
-
-    let valid = client
-        .get(&url)
-        .bearer_auth("sk-test")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(valid.status(), 200);
 }
 
 #[tokio::test]

@@ -154,7 +154,6 @@
     "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac", "#a0cbe8", "#ffbe7d",
     "#8cd17d", "#b6992d", "#499894", "#d37295", "#fabfd2", "#86bcb6",
   ];
-  const HOUR_SECS = 3600;
   const RANGES = [
     { label: "24 hours", secs: 86400 },
     { label: "7 days", secs: 7 * 86400 },
@@ -200,7 +199,7 @@
   }
 
   function aggregate() {
-    const size = HOUR_SECS;
+    const size = state.data.bucket_secs;
     const now = state.data.generated_at;
     const end = Math.floor(now / size) * size;
     const count = Math.max(1, Math.ceil(state.range / size));

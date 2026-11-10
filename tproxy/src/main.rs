@@ -2,14 +2,13 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::{
     fs,
-    net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 use tokio::net::lookup_host;
 use tproxy::{
     cli,
-    config::{Config, default_path, warn_if_insecure, warn_if_insecure_key},
+    config::{Config, default_path, warn_if_insecure},
     proxy::{self, AppState},
     usage::Usage,
 };
@@ -68,27 +67,6 @@ async fn serve(path: &Path) -> Result<()> {
     let config = Config::load(path)?;
     let _guard = init_logging(config.server.log.as_deref())?;
     warn_if_insecure(path);
-    let usage_path = tproxy::usage::default_path();
-    tracing::info!(path = %usage_path.display(), "usage data");
-    let usage = Usage::load(usage_path);
-    let state = AppState::with_usage(config.clone(), usage.clone())?;
-    let flush = tokio::spawn(usage.clone().flush_loop());
-
-    let port: u16 = config
-        .server
-        .port
-        .parse()
-        .with_context(|| format!("invalid server.port {:?}", config.server.port))?;
-    let addr = lookup_host((config.server.host.as_str(), port))
-        .await
-        .context("resolve server address")?
-        .next()
-        .context("server address resolved to nothing")?;
-    let tls = config.server.cert.is_some();
-    check_transport(addr, tls, config.server.allow_insecure)?;
-    if let Some(key) = &config.server.key {
-        warn_if_insecure_key(key);
-    }
 
     for (alias, model) in &config.models {
         if model.endpoint.starts_with("http://") {
@@ -100,35 +78,34 @@ async fn serve(path: &Path) -> Result<()> {
             tracing::warn!(user = name, "API key is shorter than 16 characters");
         }
     }
-    if !tls {
-        tracing::warn!(%addr, "TLS is disabled");
-    }
 
-    tracing::info!(
-        %addr,
-        tls,
-        models = config.models.len(),
-        users = config.users.len(),
-        "starting tproxy"
-    );
+    let port: u16 = config
+        .server
+        .port
+        .parse()
+        .with_context(|| format!("invalid server.port {:?}", config.server.port))?;
+    let host = config.server.host.clone();
+    let models = config.models.len();
+    let users = config.users.len();
+
+    let usage_path = tproxy::usage::default_path();
+    tracing::info!(path = %usage_path.display(), "usage data");
+    let usage = Usage::load(usage_path);
+    let state = AppState::with_usage(config, usage.clone())?;
+
+    let addr = lookup_host((host.as_str(), port))
+        .await
+        .context("resolve server address")?
+        .next()
+        .context("server address resolved to nothing")?;
+    tracing::info!(%addr, models, users, "starting tproxy");
 
     let app = proxy::router(state);
-    let server = async {
-        if let (Some(cert), Some(key)) = (&config.server.cert, &config.server.key) {
-            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
-                .await
-                .context("load TLS certificate")?;
-            axum_server::bind_rustls(addr, tls)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .context("server error")
-        } else {
-            axum_server::bind(addr)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .context("server error")
-        }
-    };
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind {addr}"))?;
+    let flush = tokio::spawn(usage.clone().flush_loop());
+    let server = async { axum::serve(listener, app).await.context("server error") };
 
     let result = tokio::select! {
         result = server => result,
@@ -174,15 +151,6 @@ fn refuse_uid(uid: libc::uid_t) -> Result<()> {
     Ok(())
 }
 
-fn check_transport(addr: SocketAddr, tls: bool, allow_insecure: bool) -> Result<()> {
-    if !tls && !allow_insecure && !addr.ip().is_loopback() {
-        bail!(
-            "refusing plaintext HTTP on non-loopback address {addr}; configure server.cert/server.key or set server.allow_insecure: true"
-        );
-    }
-    Ok(())
-}
-
 fn init_logging(path: Option<&Path>) -> Result<Option<WorkerGuard>> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("tproxy=info"));
@@ -220,15 +188,5 @@ mod tests {
     fn refuses_root_uid() {
         assert!(refuse_uid(0).is_err());
         assert!(refuse_uid(1000).is_ok());
-    }
-
-    #[test]
-    fn refuses_public_plaintext() {
-        let public: SocketAddr = "0.0.0.0:8001".parse().unwrap();
-        let local: SocketAddr = "127.0.0.1:8001".parse().unwrap();
-        assert!(check_transport(public, false, false).is_err());
-        assert!(check_transport(public, true, false).is_ok());
-        assert!(check_transport(public, false, true).is_ok());
-        assert!(check_transport(local, false, false).is_ok());
     }
 }

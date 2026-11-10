@@ -2,7 +2,7 @@ use crate::{config::Config, usage::Usage};
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{ConnectInfo, Request, State},
+    extract::{Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -13,7 +13,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -26,15 +25,13 @@ const DASHBOARD: &str = include_str!("dashboard.html");
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
-    pub usage: Usage,
+    config: Arc<Config>,
+    usage: Usage,
     client: reqwest::Client,
     keys: Arc<Vec<(String, [u8; 32])>>,
     models: Bytes,
     secrets: Arc<Vec<Vec<u8>>>,
     user_limiter: Arc<RateLimiter>,
-    ip_limiter: Arc<RateLimiter>,
-    ip_total_limiter: Arc<RateLimiter>,
     concurrency: Arc<Semaphore>,
 }
 
@@ -47,9 +44,6 @@ impl AppState {
         config.validate()?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(
-                config.server.upstream_read_timeout_secs,
-            ))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("tproxy/", env!("CARGO_PKG_VERSION")))
             .build()?;
@@ -99,7 +93,6 @@ impl AppState {
         secrets.dedup();
         secrets.sort_by_key(|key| std::cmp::Reverse(key.len()));
         let rate_limit = config.server.rate_limit;
-        let ip_rate_limit = config.server.ip_rate_limit;
         let max_concurrency = config.server.max_concurrency;
 
         Ok(Self {
@@ -110,31 +103,18 @@ impl AppState {
             models,
             secrets: Arc::new(secrets),
             user_limiter: Arc::new(RateLimiter::new(rate_limit)),
-            ip_limiter: Arc::new(RateLimiter::new(rate_limit)),
-            ip_total_limiter: Arc::new(RateLimiter::new(ip_rate_limit)),
             concurrency: Arc::new(Semaphore::new(max_concurrency)),
         })
     }
 
-    fn authorize(&self, headers: &HeaderMap, ip: IpAddr) -> Result<&str, ApiError> {
-        let ip = ip.to_string();
-        self.ip_total_limiter
-            .check(&ip)
+    fn authorize(&self, headers: &HeaderMap) -> Result<&str, ApiError> {
+        let user = self
+            .authenticate(headers)
+            .ok_or_else(ApiError::unauthorized)?;
+        self.user_limiter
+            .check(user)
             .map_err(|limit| ApiError::rate_limited(limit.retry_after))?;
-        match self.authenticate(headers) {
-            Some(user) => {
-                self.user_limiter
-                    .check(user)
-                    .map_err(|limit| ApiError::rate_limited(limit.retry_after))?;
-                Ok(user)
-            }
-            None => {
-                self.ip_limiter
-                    .check(&ip)
-                    .map_err(|limit| ApiError::rate_limited(limit.retry_after))?;
-                Err(ApiError::unauthorized())
-            }
-        }
+        Ok(user)
     }
 
     fn authenticate(&self, headers: &HeaderMap) -> Option<&str> {
@@ -263,12 +243,8 @@ async fn usage_json(State(state): State<AppState>) -> Result<Response, ApiError>
     Ok(response)
 }
 
-async fn models(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    state.authorize(&headers, addr.ip())?;
+async fn models(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    state.authorize(&headers)?;
     let mut response = Response::new(Body::from(state.models.clone()));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -277,23 +253,13 @@ async fn models(
     Ok(response)
 }
 
-async fn forward(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    request: Request,
-) -> Result<Response, ApiError> {
-    let user = state.authorize(request.headers(), addr.ip())?;
-    let uri = request.uri().clone();
-    let method = request.method().clone();
-    let headers = request.headers().clone();
-    if !state
-        .config
-        .server
-        .allowed_paths
-        .iter()
-        .any(|path| path == uri.path())
-        || !safe_upstream_path(uri.path())
-    {
+async fn forward(State(state): State<AppState>, request: Request) -> Result<Response, ApiError> {
+    let (parts, body) = request.into_parts();
+    let user = state.authorize(&parts.headers)?;
+    let uri = parts.uri;
+    let method = parts.method;
+    let headers = parts.headers;
+    if !safe_upstream_path(uri.path()) {
         return Err(ApiError::not_found("endpoint not allowed"));
     }
     let permit = state
@@ -301,13 +267,9 @@ async fn forward(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::overloaded())?;
-    let body = tokio::time::timeout(
-        Duration::from_secs(state.config.server.body_timeout_secs),
-        to_bytes(request.into_body(), state.config.server.max_body_bytes),
-    )
-    .await
-    .map_err(|_| ApiError::request_timeout())?
-    .map_err(|e| ApiError::bad_request(format!("read request body: {e}")))?;
+    let body = to_bytes(body, usize::MAX)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("read request body: {e}")))?;
 
     let mut payload: Value = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?;
@@ -467,7 +429,6 @@ fn is_sensitive_header(name: &str) -> bool {
     matches!(
         name,
         "authorization"
-            | "proxy-authorization"
             | "cookie"
             | "cookie2"
             | "set-cookie"
@@ -567,10 +528,6 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
 
-    fn request_timeout() -> Self {
-        Self::new(StatusCode::REQUEST_TIMEOUT, "request body timeout")
-    }
-
     fn rate_limited(retry_after: u64) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -660,22 +617,6 @@ mod tests {
                 .is_err()
         );
         assert!(limiter.check_at("a", now + Duration::from_secs(60)).is_ok());
-    }
-
-    #[test]
-    fn ip_total_limit_precedes_auth() {
-        let mut config = Config::default();
-        config.server.ip_rate_limit = 2;
-        config.users.insert("me".into(), "sk-test".into());
-        let state = AppState::new(config).unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "Bearer sk-test".parse().unwrap());
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-
-        assert!(state.authorize(&headers, ip).is_ok());
-        assert!(state.authorize(&headers, ip).is_ok());
-        let limited = state.authorize(&headers, ip).unwrap_err();
-        assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
