@@ -8,6 +8,8 @@ server:
   port: 80
   # Serve plain HTTP. When false, cert and key are required.
   allow_insecure: false
+  # Accept invalid upstream TLS certificates (self-signed, wrong hostname).
+  allow_insecure_upstream: false
   cert: "/etc/rpanel/cert.pem"
   key: "/etc/rpanel/key.pem"
 

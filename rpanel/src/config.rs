@@ -33,6 +33,9 @@ pub struct ServerConfig {
     /// Serve plain HTTP instead of HTTPS.
     #[serde(default)]
     pub allow_insecure: bool,
+    /// Accept invalid upstream TLS certificates (self-signed, wrong hostname).
+    #[serde(default)]
+    pub allow_insecure_upstream: bool,
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
 }
@@ -44,6 +47,7 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             allow_insecure: false,
+            allow_insecure_upstream: false,
             cert: None,
             key: None,
         }

@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
         .ok();
 
     let routes = Arc::new(build_routes(&config.groups));
-    let client = build_client()?;
+    let client = build_client(config.server.allow_insecure_upstream)?;
     let network = Arc::new(NetworkHistory::new(Duration::from_secs(32 * 24 * 60 * 60)));
 
     if config.panel.enable && config.panel.status.network {

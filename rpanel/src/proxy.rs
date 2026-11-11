@@ -27,6 +27,13 @@ const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 
 pub async fn handler(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let path = req.uri().path();
+    if let Some(location) = trailing_slash_redirect(&state.routes, path, req.uri().query()) {
+        return (
+            StatusCode::PERMANENT_REDIRECT,
+            [(header::LOCATION, location)],
+        )
+            .into_response();
+    }
     let Some(route) = state
         .routes
         .iter()
@@ -78,6 +85,7 @@ async fn forward(
         header::HOST,
         HeaderValue::from_str(&route.host).context("invalid upstream host")?,
     );
+    rewrite_origin_headers(headers, route);
     if let Some(ip) = client_ip {
         append_forwarded(headers, X_FORWARDED_FOR, &ip.to_string());
         headers.insert(
@@ -107,6 +115,71 @@ async fn forward(
     builder
         .body(Body::new(body))
         .context("building downstream response")
+}
+
+/// Rewrites `Origin` and `Referer` to the upstream origin so CSRF checks
+/// that compare them against the rewritten `Host` header keep working.
+fn rewrite_origin_headers(headers: &mut HeaderMap, route: &Route) {
+    let scheme = if route.https { "https" } else { "http" };
+    let origin = format!("{scheme}://{}", route.host);
+
+    if headers.contains_key(header::ORIGIN) {
+        match HeaderValue::from_str(&origin) {
+            Ok(value) => {
+                headers.insert(header::ORIGIN, value);
+            }
+            Err(_) => {
+                headers.remove(header::ORIGIN);
+            }
+        }
+    }
+
+    if let Some(referer) = headers.get(header::REFERER).cloned() {
+        let rewritten = referer
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<Uri>().ok())
+            .and_then(|uri| {
+                let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+                format!("{origin}{path}").parse::<HeaderValue>().ok()
+            });
+        match rewritten {
+            Some(value) => {
+                headers.insert(header::REFERER, value);
+            }
+            None => {
+                headers.remove(header::REFERER);
+            }
+        }
+    }
+}
+
+/// Redirects a bare prefix to its trailing-slash form when both an exact
+/// route and a wildcard route exist for that prefix. This keeps relative
+/// asset and API URLs resolving under the prefix.
+fn trailing_slash_redirect(routes: &[Route], path: &str, query: Option<&str>) -> Option<String> {
+    if path.ends_with('/') {
+        return None;
+    }
+    let exact = routes
+        .iter()
+        .any(|route| !route.is_wildcard() && route.capture(path).is_some());
+    if !exact {
+        return None;
+    }
+    let with_slash = format!("{path}/");
+    let wildcard = routes
+        .iter()
+        .any(|route| route.is_wildcard() && route.capture(&with_slash).is_some());
+    if !wildcard {
+        return None;
+    }
+    let mut location = with_slash;
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        location.push('?');
+        location.push_str(query);
+    }
+    Some(location)
 }
 
 fn copy_headers(source: &HeaderMap, target: &mut HeaderMap) {
@@ -158,6 +231,60 @@ fn append_forwarded(headers: &mut HeaderMap, name: HeaderName, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirects_bare_prefix_to_trailing_slash() {
+        let group = crate::config::Group {
+            host: "nastty.local:8080".into(),
+            https: true,
+            paths: [
+                ("/qbittorrent".to_string(), "/".to_string()),
+                ("/qbittorrent/*".to_string(), "/*".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let routes =
+            crate::route::build_routes(&indexmap::IndexMap::from([("qbit".to_string(), group)]));
+
+        assert_eq!(
+            trailing_slash_redirect(&routes, "/qbittorrent", None).as_deref(),
+            Some("/qbittorrent/")
+        );
+        assert_eq!(
+            trailing_slash_redirect(&routes, "/qbittorrent", Some("a=1")).as_deref(),
+            Some("/qbittorrent/?a=1")
+        );
+        assert_eq!(
+            trailing_slash_redirect(&routes, "/qbittorrent/", None),
+            None
+        );
+        assert_eq!(trailing_slash_redirect(&routes, "/other", None), None);
+    }
+
+    #[test]
+    fn rewrites_origin_and_referer_to_upstream() {
+        let group = crate::config::Group {
+            host: "nastty.local:8080".into(),
+            https: true,
+            paths: Default::default(),
+        };
+        let route = Route::new("qbit", &group, "/qbittorrent/*", "/*");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, HeaderValue::from_static("https://cow"));
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("https://cow/qbittorrent/"),
+        );
+
+        rewrite_origin_headers(&mut headers, &route);
+
+        assert_eq!(headers[header::ORIGIN], "https://nastty.local:8080");
+        assert_eq!(
+            headers[header::REFERER],
+            "https://nastty.local:8080/qbittorrent/"
+        );
+    }
 
     #[test]
     fn identifies_hop_by_hop_headers() {

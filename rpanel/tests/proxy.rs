@@ -59,7 +59,7 @@ fn state(config: Config) -> Arc<AppState> {
     Arc::new(AppState {
         config: Arc::new(config),
         routes,
-        client: build_client().unwrap(),
+        client: build_client(false).unwrap(),
         panel: None,
     })
 }
@@ -151,7 +151,7 @@ groups: {}
     let state = Arc::new(AppState {
         config: Arc::new(config),
         routes: Arc::new(Vec::new()),
-        client: build_client().unwrap(),
+        client: build_client(false).unwrap(),
         panel: Some(panel_state),
     });
     let app = Router::new()

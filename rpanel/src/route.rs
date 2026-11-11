@@ -36,6 +36,10 @@ impl Route {
         }
     }
 
+    pub fn is_wildcard(&self) -> bool {
+        self.wildcard
+    }
+
     /// Returns the wildcard capture for `path`, or `Some("")` for an exact match.
     pub fn capture<'a>(&self, path: &'a str) -> Option<&'a str> {
         if self.wildcard {

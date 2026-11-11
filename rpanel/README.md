@@ -34,6 +34,7 @@ See [`rpanel.example.yaml`](rpanel.example.yaml) for a complete example.
 | `host` | `127.0.0.1` | Listen address. |
 | `port` | `80` | Listen port. |
 | `allow_insecure` | `false` | Serve plain HTTP instead of HTTPS. |
+| `allow_insecure_upstream` | `false` | Accept invalid upstream TLS certificates (self-signed, wrong hostname). |
 | `cert` | — | PEM certificate chain, required unless `allow_insecure`. |
 | `key` | — | PEM private key, required unless `allow_insecure`. |
 
