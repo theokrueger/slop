@@ -8,7 +8,7 @@ use axum::{
 
 use crate::{
     config::{PanelConfig, StatusConfig},
-    net::Rates,
+    net::Snapshot,
     state::AppState,
     status::{self, RamInfo, ServiceStatus, StorageInfo, SystemStatus},
 };
@@ -18,8 +18,8 @@ pub async fn handler(State(state): State<Arc<AppState>>) -> Response {
         return (StatusCode::INTERNAL_SERVER_ERROR, "panel unavailable\n").into_response();
     };
     let status = status::collect(&panel.config.status).await;
-    let rates = panel.network.rates(Instant::now());
-    let mut response = Html(render(&panel.config, &status, &rates)).into_response();
+    let stats = panel.network.snapshot(Instant::now());
+    let mut response = Html(render(&panel.config, &status, &stats)).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
@@ -35,7 +35,7 @@ pub async fn handler(State(state): State<Arc<AppState>>) -> Response {
     response
 }
 
-pub fn render(config: &PanelConfig, status: &SystemStatus, rates: &Rates) -> String {
+pub fn render(config: &PanelConfig, status: &SystemStatus, stats: &Snapshot) -> String {
     let show_status = has_status(&config.status);
     let refresh = if config.refresh_seconds > 0 && show_status {
         format!(
@@ -97,7 +97,7 @@ pub fn render(config: &PanelConfig, status: &SystemStatus, rates: &Rates) -> Str
             render_storage(&mut html, &status.storage);
         }
         if config.status.network {
-            render_network(&mut html, rates);
+            render_network(&mut html, stats);
         }
         if !config.status.status.is_empty() {
             render_services(&mut html, &status.services);
@@ -178,25 +178,30 @@ fn render_storage(html: &mut String, storage: &[StorageInfo]) {
     html.push_str("</section>");
 }
 
-fn render_network(html: &mut String, rates: &Rates) {
-    let rows = [
-        ("Now", rates.now),
-        ("5 min", rates.five_min),
-        ("1 hour", rates.hour),
-        ("1 day", rates.day),
-        ("1 month", rates.month),
-        ("All time", rates.all_time),
-    ];
+fn render_network(html: &mut String, stats: &Snapshot) {
     html.push_str(
         r#"<section class="card"><h2>Network</h2><table><thead><tr><th>Window</th><th>Down</th><th>Up</th></tr></thead><tbody>"#,
     );
-    for (label, rate) in rows {
+    let _ = write!(
+        html,
+        "<tr><th>Now</th><td>{}</td><td>{}</td></tr>",
+        format_rate(stats.now.rx),
+        format_rate(stats.now.tx)
+    );
+    let windows = [
+        ("5 min", stats.five_min),
+        ("1 hour", stats.hour),
+        ("1 day", stats.day),
+        ("1 month", stats.month),
+        ("All time", stats.all_time),
+    ];
+    for (label, transfer) in windows {
         let _ = write!(
             html,
             "<tr><th>{}</th><td>{}</td><td>{}</td></tr>",
             label,
-            format_rate(rate.rx),
-            format_rate(rate.tx)
+            format_bytes(transfer.rx),
+            format_bytes(transfer.tx)
         );
     }
     html.push_str("</tbody></table></section>");
@@ -379,7 +384,7 @@ mod tests {
     use super::*;
     use crate::{
         config::Service,
-        net::Rate,
+        net::{Rate, Transfer},
         status::{RamInfo, ServiceStatus, StorageInfo},
     };
 
@@ -427,20 +432,20 @@ mod tests {
         }
     }
 
-    fn rates() -> Rates {
-        Rates {
+    fn stats() -> Snapshot {
+        Snapshot {
             now: Rate {
                 rx: 1024.0,
                 tx: 2048.0,
             },
-            five_min: Rate {
-                rx: 100.0,
-                tx: 200.0,
+            five_min: Transfer {
+                rx: 5 * 1024 * 1024,
+                tx: 10 * 1024 * 1024,
             },
-            hour: Rate::default(),
-            day: Rate::default(),
-            month: Rate::default(),
-            all_time: Rate::default(),
+            hour: Transfer::default(),
+            day: Transfer::default(),
+            month: Transfer::default(),
+            all_time: Transfer::default(),
         }
     }
 
@@ -465,7 +470,7 @@ mod tests {
 
     #[test]
     fn renders_links_and_status() {
-        let html = render(&config(), &status(), &rates());
+        let html = render(&config(), &status(), &stats());
         assert!(html.contains(r#"href="/tary""#));
         assert!(html.contains(">Tary<"));
         assert!(html.contains("Uptime"));
@@ -473,6 +478,9 @@ mod tests {
         assert!(html.contains("Memory"));
         assert!(html.contains("Storage"));
         assert!(html.contains("Network"));
+        assert!(html.contains("1.0 KiB/s"));
+        assert!(html.contains("5.0 MiB"));
+        assert!(html.contains("10 MiB"));
         assert!(html.contains("running · Tary service"));
         assert!(html.contains(r#"http-equiv="refresh" content="10""#));
     }
@@ -485,7 +493,7 @@ mod tests {
         config.status.uptime = false;
         config.status.network = false;
         config.status.status.clear();
-        let html = render(&config, &status(), &rates());
+        let html = render(&config, &status(), &stats());
         assert!(!html.contains("Storage"));
         assert!(!html.contains("Memory"));
         assert!(!html.contains("Uptime"));
@@ -498,7 +506,7 @@ mod tests {
     fn escapes_link_names_and_urls() {
         let mut config = config();
         config.links = IndexMap::from([("<script>".to_string(), "\"x\"".to_string())]);
-        let html = render(&config, &status(), &rates());
+        let html = render(&config, &status(), &stats());
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("href=\"&quot;x&quot;\""));
         assert!(!html.contains("<script>"));

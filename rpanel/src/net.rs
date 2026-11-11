@@ -20,14 +20,22 @@ pub struct Rate {
     pub tx: f64,
 }
 
+/// Bytes transferred over a window.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Transfer {
+    pub rx: u64,
+    pub tx: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Rates {
+pub struct Snapshot {
+    /// Current speed, derived from the last two samples.
     pub now: Rate,
-    pub five_min: Rate,
-    pub hour: Rate,
-    pub day: Rate,
-    pub month: Rate,
-    pub all_time: Rate,
+    pub five_min: Transfer,
+    pub hour: Transfer,
+    pub day: Transfer,
+    pub month: Transfer,
+    pub all_time: Transfer,
 }
 
 /// Rolling totals of all non-loopback interfaces, used to derive throughput.
@@ -67,11 +75,11 @@ impl NetworkHistory {
         }
     }
 
-    pub fn rates(&self, now: Instant) -> Rates {
+    pub fn snapshot(&self, now: Instant) -> Snapshot {
         let history = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let samples = &history.samples;
         let Some(latest) = samples.last() else {
-            return Rates::default();
+            return Snapshot::default();
         };
 
         let now_rate = if samples.len() >= 2 {
@@ -88,15 +96,15 @@ impl NetworkHistory {
             } else {
                 &samples[index - 1]
             };
-            rate_between(base, latest)
+            transfer_between(base, latest)
         };
 
         let all_time = history
             .start
-            .map(|start| rate_between(&start, latest))
+            .map(|start| transfer_between(&start, latest))
             .unwrap_or_default();
 
-        Rates {
+        Snapshot {
             now: now_rate,
             five_min: window(Duration::from_secs(5 * 60)),
             hour: window(Duration::from_secs(60 * 60)),
@@ -112,20 +120,24 @@ fn rate_between(a: &Sample, b: &Sample) -> Rate {
     if seconds <= 0.0 {
         return Rate::default();
     }
+    let transfer = transfer_between(a, b);
     Rate {
-        rx: delta(a.rx, b.rx) / seconds,
-        tx: delta(a.tx, b.tx) / seconds,
+        rx: transfer.rx as f64 / seconds,
+        tx: transfer.tx as f64 / seconds,
+    }
+}
+
+fn transfer_between(a: &Sample, b: &Sample) -> Transfer {
+    Transfer {
+        rx: delta(a.rx, b.rx),
+        tx: delta(a.tx, b.tx),
     }
 }
 
 /// Counters can reset when an interface is recreated; treat a decrease as a
 /// fresh counter rather than underflowing.
-fn delta(old: u64, new: u64) -> f64 {
-    if new >= old {
-        (new - old) as f64
-    } else {
-        new as f64
-    }
+fn delta(old: u64, new: u64) -> u64 {
+    if new >= old { new - old } else { new }
 }
 
 /// Sample network counters in the background. The first sample is taken
@@ -184,26 +196,26 @@ mod tests {
         history.push(at(now, 10), 1_000, 2_000);
         history.push(now, 3_000, 6_000);
 
-        let rates = history.rates(now);
+        let stats = history.snapshot(now);
         assert_eq!(
-            rates.now,
+            stats.now,
             Rate {
                 rx: 200.0,
                 tx: 400.0
             }
         );
         assert_eq!(
-            rates.five_min,
-            Rate {
-                rx: 150.0,
-                tx: 300.0
+            stats.five_min,
+            Transfer {
+                rx: 3_000,
+                tx: 6_000
             }
         );
         assert_eq!(
-            rates.all_time,
-            Rate {
-                rx: 150.0,
-                tx: 300.0
+            stats.all_time,
+            Transfer {
+                rx: 3_000,
+                tx: 6_000
             }
         );
     }
@@ -215,16 +227,17 @@ mod tests {
         history.push(at(now, 10), 1_000, 1_000);
         history.push(now, 500, 500);
 
-        let rates = history.rates(now);
-        assert_eq!(rates.now, Rate { rx: 50.0, tx: 50.0 });
+        let stats = history.snapshot(now);
+        assert_eq!(stats.now, Rate { rx: 50.0, tx: 50.0 });
+        assert_eq!(stats.all_time, Transfer { rx: 500, tx: 500 });
     }
 
     #[test]
     fn empty_history_is_zero() {
         let history = NetworkHistory::new(MONTH);
-        let rates = history.rates(Instant::now());
-        assert_eq!(rates.now, Rate::default());
-        assert_eq!(rates.all_time, Rate::default());
+        let stats = history.snapshot(Instant::now());
+        assert_eq!(stats.now, Rate::default());
+        assert_eq!(stats.all_time, Transfer::default());
     }
 
     #[test]
@@ -257,7 +270,13 @@ mod tests {
         history.push(at(now, 20), 1_000, 1_000);
         history.push(now, 2_000, 2_000);
 
-        let rates = history.rates(now);
-        assert_eq!(rates.all_time, Rate { rx: 20.0, tx: 20.0 });
+        let stats = history.snapshot(now);
+        assert_eq!(
+            stats.all_time,
+            Transfer {
+                rx: 2_000,
+                tx: 2_000
+            }
+        );
     }
 }

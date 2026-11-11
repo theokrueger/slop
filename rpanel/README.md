@@ -47,7 +47,7 @@ See [`rpanel.example.yaml`](rpanel.example.yaml) for a complete example.
 | `status.storage` | `true` | Mounted drive usage. |
 | `status.ram` | `true` | RAM and swap usage. |
 | `status.uptime` | `true` | System uptime. |
-| `status.network` | `true` | Throughput over several windows. |
+| `status.network` | `true` | Current speed and throughput windows. |
 | `status.status` | `[]` | systemd units to report. |
 | `links` | `{}` | Display name -> URL, rendered in order. |
 
@@ -61,7 +61,8 @@ status:
     user: true
 ```
 
-Network throughput is sampled every 10 seconds and reported for now, the last
+Network counters are sampled every 10 seconds. The panel shows the current
+upload/download speed for "Now", and the total bytes transferred for the last
 5 minutes, hour, day, month, and since rpanel started. Loopback interfaces are
 excluded.
 
