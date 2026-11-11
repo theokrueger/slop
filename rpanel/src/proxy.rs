@@ -11,6 +11,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
+use hyper_util::rt::TokioIo;
 use tracing::warn;
 
 use crate::{
@@ -24,6 +25,7 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
+const X_FORWARDED_PREFIX: HeaderName = HeaderName::from_static("x-forwarded-prefix");
 
 pub async fn handler(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let path = req.uri().path();
@@ -57,13 +59,148 @@ pub async fn handler(State(state): State<Arc<AppState>>, req: Request) -> Respon
         "https"
     };
 
-    match forward(&state.client, route, uri, req, client_ip, proto).await {
+    let result = if is_upgrade_request(&req) {
+        forward_upgrade(&state.client, route, uri, req, client_ip, proto).await
+    } else {
+        forward(&state.client, route, uri, req, client_ip, proto).await
+    };
+    match result {
         Ok(response) => response,
         Err(error) => {
             warn!(group = %route.group, %error, "upstream request failed");
             (StatusCode::BAD_GATEWAY, "bad gateway\n").into_response()
         }
     }
+}
+
+/// Whether the request asks to switch protocols (a WebSocket handshake, or any
+/// other `Connection: Upgrade` request).
+fn is_upgrade_request(req: &Request) -> bool {
+    req.headers().contains_key(header::UPGRADE)
+        && req
+            .headers()
+            .get_all(header::CONNECTION)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+/// Proxies a protocol-upgrade request (WebSocket) by tunnelling the two upgraded
+/// connections after the upstream answers `101 Switching Protocols`.
+async fn forward_upgrade(
+    client: &ProxyClient,
+    route: &Route,
+    uri: Uri,
+    mut req: Request,
+    client_ip: Option<IpAddr>,
+    proto: &'static str,
+) -> Result<Response> {
+    // Capture the downstream upgrade before splitting the request: `Parts` is
+    // not upgradeable, but `&mut Request` is.
+    let downstream = hyper::upgrade::on(&mut req);
+    let (parts, body) = req.into_parts();
+
+    let mut builder = Request::builder()
+        .method(parts.method.clone())
+        .uri(uri)
+        .version(hyper::Version::HTTP_11);
+    let headers = builder
+        .headers_mut()
+        .context("request builder has no headers")?;
+    copy_upgrade_headers(&parts.headers, headers);
+    headers.insert(
+        header::HOST,
+        HeaderValue::from_str(&route.host).context("invalid upstream host")?,
+    );
+    rewrite_origin_headers(headers, route);
+    if let Some(ip) = client_ip {
+        append_forwarded(headers, X_FORWARDED_FOR, &ip.to_string());
+        headers.insert(
+            X_REAL_IP,
+            HeaderValue::from_str(&ip.to_string()).context("invalid client IP")?,
+        );
+    }
+    if let Some(host) = parts.headers.get(header::HOST) {
+        headers.insert(X_FORWARDED_HOST, host.clone());
+    }
+    headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(proto));
+    if let Some(prefix) = route.forwarded_prefix()
+        && let Ok(value) = HeaderValue::from_str(prefix)
+    {
+        headers.insert(X_FORWARDED_PREFIX, value);
+    }
+
+    let request = builder.body(body).context("building upstream request")?;
+    let mut response = tokio::time::timeout(UPSTREAM_TIMEOUT, client.request(request))
+        .await
+        .context("upstream timed out")?
+        .context("upstream request failed")?;
+
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        // The upstream declined the upgrade; relay its response as a normal one.
+        let (parts, body) = response.into_parts();
+        let mut builder = Response::builder()
+            .status(parts.status)
+            .version(parts.version);
+        let headers = builder
+            .headers_mut()
+            .context("response builder has no headers")?;
+        copy_headers(&parts.headers, headers);
+        return builder
+            .body(Body::new(body))
+            .context("building downstream response");
+    }
+
+    let upstream = hyper::upgrade::on(&mut response);
+
+    tokio::spawn(async move {
+        let (down, up) = match (downstream.await, upstream.await) {
+            (Ok(down), Ok(up)) => (down, up),
+            (down, up) => {
+                if let Err(error) = down {
+                    warn!(%error, "downstream upgrade failed");
+                }
+                if let Err(error) = up {
+                    warn!(%error, "upstream upgrade failed");
+                }
+                return;
+            }
+        };
+        let (mut down_read, mut down_write) = tokio::io::split(TokioIo::new(down));
+        let (mut up_read, mut up_write) = tokio::io::split(TokioIo::new(up));
+        tokio::select! {
+            result = tokio::io::copy(&mut down_read, &mut up_write) => {
+                if let Err(error) = result {
+                    warn!(%error, "upgraded client->upstream copy failed");
+                }
+            }
+            result = tokio::io::copy(&mut up_read, &mut down_write) => {
+                if let Err(error) = result {
+                    warn!(%error, "upgraded upstream->client copy failed");
+                }
+            }
+        }
+    });
+
+    // Relay the 101 handshake response; hyper flushes it and upgrades the
+    // downstream connection, which resolves the `downstream` future above.
+    let (parts, _body) = response.into_parts();
+    let mut builder = Response::builder()
+        .status(parts.status)
+        .version(parts.version);
+    let headers = builder
+        .headers_mut()
+        .context("response builder has no headers")?;
+    copy_headers(&parts.headers, headers);
+    for name in [header::CONNECTION, header::UPGRADE] {
+        if let Some(value) = parts.headers.get(&name) {
+            headers.insert(name, value.clone());
+        }
+    }
+    builder
+        .body(Body::empty())
+        .context("building downstream response")
 }
 
 async fn forward(
@@ -97,6 +234,11 @@ async fn forward(
         headers.insert(X_FORWARDED_HOST, host.clone());
     }
     headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(proto));
+    if let Some(prefix) = route.forwarded_prefix()
+        && let Ok(value) = HeaderValue::from_str(prefix)
+    {
+        headers.insert(X_FORWARDED_PREFIX, value);
+    }
 
     let request = builder.body(body).context("building upstream request")?;
     let response = tokio::time::timeout(UPSTREAM_TIMEOUT, client.request(request))
@@ -182,6 +324,22 @@ fn trailing_slash_redirect(routes: &[Route], path: &str, query: Option<&str>) ->
     Some(location)
 }
 
+/// Copies request headers for a protocol upgrade, keeping `Connection` and
+/// `Upgrade` (and the `Sec-WebSocket-*` handshake headers) that `copy_headers`
+/// would strip as hop-by-hop.
+fn copy_upgrade_headers(source: &HeaderMap, target: &mut HeaderMap) {
+    for (name, value) in source {
+        if name == header::CONNECTION || name == header::UPGRADE {
+            target.append(name.clone(), value.clone());
+            continue;
+        }
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        target.append(name.clone(), value.clone());
+    }
+}
+
 fn copy_headers(source: &HeaderMap, target: &mut HeaderMap) {
     let connection_headers = connection_header_names(source);
     for (name, value) in source {
@@ -243,6 +401,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            forwarded_prefix: false,
         };
         let routes =
             crate::route::build_routes(&indexmap::IndexMap::from([("qbit".to_string(), group)]));
@@ -268,6 +427,7 @@ mod tests {
             host: "nastty.local:8080".into(),
             https: true,
             paths: Default::default(),
+            forwarded_prefix: false,
         };
         let route = Route::new("qbit", &group, "/qbittorrent/*", "/*");
         let mut headers = HeaderMap::new();

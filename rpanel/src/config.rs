@@ -142,6 +142,11 @@ pub struct Group {
     /// Incoming path pattern -> upstream path pattern.
     #[serde(default)]
     pub paths: IndexMap<String, String>,
+    /// Send `X-Forwarded-Prefix` with the matched incoming path prefix. Enable for
+    /// upstreams that build absolute URLs and must know they are served under a
+    /// subpath (e.g. apps behind a path-prefix reverse proxy).
+    #[serde(default)]
+    pub forwarded_prefix: bool,
 }
 
 impl Config {

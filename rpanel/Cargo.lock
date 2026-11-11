@@ -789,6 +789,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "http",
+ "hyper",
  "hyper-rustls",
  "hyper-util",
  "indexmap",

@@ -15,6 +15,7 @@ pub struct Route {
     to: String,
     prefix: String,
     wildcard: bool,
+    forwarded_prefix: bool,
 }
 
 impl Route {
@@ -33,11 +34,19 @@ impl Route {
             to: to.to_owned(),
             prefix,
             wildcard,
+            forwarded_prefix: config.forwarded_prefix,
         }
     }
 
     pub fn is_wildcard(&self) -> bool {
         self.wildcard
+    }
+
+    /// The `X-Forwarded-Prefix` value for this route: the incoming path prefix the
+    /// client sees, or `None` when the group did not opt in or the route is at the
+    /// root (an empty prefix).
+    pub fn forwarded_prefix(&self) -> Option<&str> {
+        (self.forwarded_prefix && self.prefix != "/").then_some(self.prefix.as_str())
     }
 
     /// Returns the wildcard capture for `path`, or `Some("")` for an exact match.
@@ -106,6 +115,7 @@ mod tests {
                 .iter()
                 .map(|(from, to)| (from.to_string(), to.to_string()))
                 .collect(),
+            forwarded_prefix: false,
         }
     }
 
