@@ -26,6 +26,7 @@ the same panes.
 - Server-side terminal emulation with reconnect snapshots and incremental
   screen diffs
 - Small, dependency-light frontend; xterm.js is vendored, no CDN required
+- Solarized light and dark palettes for both the UI and terminal
 - Relative URLs, so it can be mounted behind a path-prefix reverse proxy
 
 The default new-project layout is two `pi` sessions on the left,

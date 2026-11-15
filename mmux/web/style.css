@@ -1,34 +1,32 @@
 :root {
-  --bg: #f4f5f7;
-  --panel: #ffffff;
-  --fg: #16181c;
-  --muted: #6b7280;
-  --border: #d9dde3;
-  --hover: #eceff3;
-  --active: #e7edf6;
-  --accent: #155eef;
-  --accent-fg: #ffffff;
-  --danger: #b42318;
-  --term-bg: #ffffff;
-  --shadow: 0 12px 40px rgba(16, 24, 40, 0.16);
+  --bg: #fdf6e3;
+  --panel: #eee8d5;
+  --fg: #586e75;
+  --muted: #93a1a1;
+  --border: #d9d2bf;
+  --hover: #e7e0cd;
+  --active: #dfd8c4;
+  --danger: #dc322f;
+  --pane-focus: #d33682;
+  --term-bg: #fdf6e3;
+  --shadow: 0 12px 40px rgba(0, 43, 54, 0.16);
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0d0f12;
-    --panel: #14171b;
-    --fg: #e6e8eb;
-    --muted: #9aa2ad;
-    --border: #2a2f36;
-    --hover: #1b1f25;
-    --active: #202936;
-    --accent: #5b8cff;
-    --accent-fg: #07101f;
-    --danger: #ff8d85;
-    --term-bg: #0d0f12;
-    --shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+    --bg: #002b36;
+    --panel: #073642;
+    --fg: #93a1a1;
+    --muted: #586e75;
+    --border: #14505c;
+    --hover: #0b3a46;
+    --active: #12414d;
+    --danger: #dc322f;
+    --pane-focus: #d33682;
+    --term-bg: #002b36;
+    --shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
   }
 }
 
@@ -61,7 +59,7 @@ button {
 }
 
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--pane-focus);
   outline-offset: 1px;
 }
 
@@ -164,7 +162,7 @@ button {
 .project-rename {
   flex: 1;
   min-width: 0;
-  border: 1px solid var(--accent);
+  border: 1px solid var(--pane-focus);
   border-radius: 3px;
   background: var(--panel);
   padding: 1px 4px;
@@ -241,6 +239,7 @@ button {
 }
 
 .pane {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -249,8 +248,17 @@ button {
   overflow: hidden;
 }
 
-.pane:focus-within {
-  box-shadow: inset 0 0 0 1px var(--accent);
+.pane::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  border: 2px solid transparent;
+  pointer-events: none;
+}
+
+.pane:focus-within::after {
+  border-color: var(--pane-focus);
 }
 
 .pane-term {
@@ -308,9 +316,9 @@ button {
 }
 
 .button.primary {
-  border-color: var(--accent);
-  background: var(--accent);
-  color: var(--accent-fg);
+  border-color: var(--fg);
+  background: var(--fg);
+  color: var(--bg);
 }
 
 .button.primary:hover {
@@ -373,7 +381,7 @@ button {
 }
 
 .field input:focus {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--pane-focus);
   outline-offset: -1px;
 }
 
@@ -469,7 +477,7 @@ button {
 }
 
 .toast-action:hover {
-  border-color: var(--accent);
+  border-color: var(--pane-focus);
 }
 
 .login-body {

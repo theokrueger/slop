@@ -100,24 +100,66 @@
     return data;
   }
 
+  const SOLARIZED = {
+    base03: "#002b36",
+    base02: "#073642",
+    base01: "#586e75",
+    base00: "#657b83",
+    base0: "#839496",
+    base1: "#93a1a1",
+    base2: "#eee8d5",
+    base3: "#fdf6e3",
+    yellow: "#b58900",
+    orange: "#cb4b16",
+    red: "#dc322f",
+    magenta: "#d33682",
+    violet: "#6c71c4",
+    blue: "#268bd2",
+    cyan: "#2aa198",
+    green: "#859900",
+  };
+
+  const SOLARIZED_ANSI = {
+    black: SOLARIZED.base02,
+    red: SOLARIZED.red,
+    green: SOLARIZED.green,
+    yellow: SOLARIZED.yellow,
+    blue: SOLARIZED.blue,
+    magenta: SOLARIZED.magenta,
+    cyan: SOLARIZED.cyan,
+    white: SOLARIZED.base2,
+    // Canonical Solarized maps the bright slots to base tones, which makes
+    // standard prompts such as `01;32`/`01;34` look gray. Keep actual accent
+    // colors here so ANSI colors remain visible.
+    brightBlack: SOLARIZED.base01,
+    brightRed: SOLARIZED.orange,
+    brightGreen: SOLARIZED.green,
+    brightYellow: SOLARIZED.yellow,
+    brightBlue: SOLARIZED.blue,
+    brightMagenta: SOLARIZED.violet,
+    brightCyan: SOLARIZED.cyan,
+    brightWhite: SOLARIZED.base1,
+  };
+
   function termTheme() {
     if (darkQuery.matches) {
       return {
-        background: "#0d0f12",
-        foreground: "#d8dde4",
-        cursor: "#d8dde4",
-        selectionBackground: "#2c3a4d",
-        black: "#3b414b",
-        brightBlack: "#6b7280",
-        white: "#d8dde4",
-        brightWhite: "#ffffff",
+        ...SOLARIZED_ANSI,
+        background: SOLARIZED.base03,
+        foreground: SOLARIZED.base0,
+        cursor: SOLARIZED.base0,
+        cursorAccent: SOLARIZED.base03,
+        selectionBackground: SOLARIZED.base02,
       };
     }
     return {
-      background: "#ffffff",
-      foreground: "#1b1f24",
-      cursor: "#1b1f24",
-      selectionBackground: "#d9e4f5",
+      ...SOLARIZED_ANSI,
+      brightWhite: SOLARIZED.base1,
+      background: SOLARIZED.base3,
+      foreground: SOLARIZED.base00,
+      cursor: SOLARIZED.base00,
+      cursorAccent: SOLARIZED.base3,
+      selectionBackground: SOLARIZED.base2,
     };
   }
 
