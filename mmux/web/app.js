@@ -31,6 +31,8 @@
     loading: document.getElementById("loading"),
     app: document.getElementById("app"),
     projects: document.getElementById("projects"),
+    projectManagement: document.getElementById("project-management"),
+    projectCwd: document.getElementById("project-cwd"),
     newProject: document.getElementById("new-project"),
     user: document.getElementById("user"),
     logout: document.getElementById("logout"),
@@ -424,6 +426,9 @@
 
   function renderActiveProject() {
     const project = state.projects.find((entry) => entry.id === state.activeProjectId) || null;
+    els.projectManagement.hidden = !project;
+    els.projectCwd.textContent = project ? project.cwd : "";
+    els.projectCwd.title = project ? project.cwd : "";
     const projectKey = project ? String(project.id) : null;
 
     if (projectKey !== state.renderedProjectKey) {
