@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -18,11 +18,14 @@ use vt100::{Callbacks, Parser, Screen};
 
 use crate::config::Slot;
 use crate::session::{PaneId, ProjectId, SessionEvent};
+use crate::theme::{self, Appearance, Palette};
 
 pub const MIN_ROWS: u16 = 5;
 pub const MIN_COLS: u16 = 10;
 pub const MAX_ROWS: u16 = 500;
 pub const MAX_COLS: u16 = 1000;
+
+const RESTART_DELAY: Duration = Duration::from_millis(250);
 
 /// Everything needed to start a pane.
 #[derive(Debug, Clone)]
@@ -30,6 +33,7 @@ pub struct PaneSpec {
     pub command: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
+    pub appearance: Appearance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,10 +100,10 @@ pub struct Pane {
     id: PaneId,
     project_id: ProjectId,
     slot: Slot,
-    command: Vec<String>,
-    cwd: PathBuf,
+    spec: PaneSpec,
     state: Mutex<PaneState>,
     process: Mutex<Option<Process>>,
+    next_generation: AtomicU64,
     clients: Mutex<HashMap<u64, ClientSize>>,
     clipboard: broadcast::Sender<String>,
     output: broadcast::Sender<OutputChunk>,
@@ -117,13 +121,33 @@ struct PaneState {
 /// discover cursor position and terminal capabilities. vt100 consumes these
 /// sequences without replying, so we collect replies in a callback and send
 /// them back to the PTY after parsing each chunk.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PaneCallbacks {
     responses: String,
     clipboard: Vec<String>,
+    palette: Palette,
+}
+
+impl Default for PaneCallbacks {
+    fn default() -> Self {
+        Self::new(Appearance::default())
+    }
 }
 
 impl PaneCallbacks {
+    fn new(appearance: Appearance) -> Self {
+        Self {
+            responses: String::new(),
+            clipboard: Vec::new(),
+            palette: theme::palette(appearance),
+        }
+    }
+
+    fn osc_color(&mut self, code: &str, color: theme::Rgb) {
+        use std::fmt::Write as _;
+        let _ = write!(self.responses, "\x1b]{code};rgb:{}\x1b\\", color.xterm());
+    }
+
     fn take_responses(&mut self) -> String {
         std::mem::take(&mut self.responses)
     }
@@ -144,6 +168,31 @@ impl PaneCallbacks {
 }
 
 impl Callbacks for PaneCallbacks {
+    fn unhandled_osc(&mut self, _screen: &mut Screen, params: &[&[u8]]) {
+        let Some(kind) = params.first().copied() else {
+            return;
+        };
+        let second = params.get(1).copied();
+        match (kind, second) {
+            (b"10", Some(b"?")) => self.osc_color("10", self.palette.foreground),
+            (b"11", Some(b"?")) => self.osc_color("11", self.palette.background),
+            (b"12", Some(b"?")) => self.osc_color("12", self.palette.cursor),
+            (b"4", Some(index)) if params.get(2).is_some_and(|query| *query == b"?") => {
+                let Some(index) = std::str::from_utf8(index)
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                else {
+                    return;
+                };
+                if let Some(color) = self.palette.ansi.get(index) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.responses, "\x1b]4;{index};rgb:{}\x1b\\", color.xterm());
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn copy_to_clipboard(&mut self, _screen: &mut Screen, _ty: &[u8], data: &[u8]) {
         if data.len() > 1_000_000 {
             return;
@@ -203,6 +252,7 @@ struct Process {
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     pgid: Option<i32>,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -221,8 +271,8 @@ impl Drop for Pane {
 }
 
 impl Pane {
-    /// Spawns the pane. A failure to start the program is displayed in the
-    /// pane (and reported as an exited status) instead of disappearing.
+    /// Spawns the pane and supervises its command. Exits and startup failures
+    /// are reported in the pane before the same command is tried again.
     pub fn spawn(
         id: PaneId,
         project_id: ProjectId,
@@ -232,7 +282,7 @@ impl Pane {
         events: broadcast::Sender<SessionEvent>,
     ) -> Arc<Self> {
         let (rows, cols) = sanitize_size(size.0, size.1);
-        let parser = Parser::new_with_callbacks(rows, cols, 0, PaneCallbacks::default());
+        let parser = Parser::new_with_callbacks(rows, cols, 0, PaneCallbacks::new(spec.appearance));
         let (clipboard, _) = broadcast::channel(64);
         let (output, _) = broadcast::channel(512);
         let started = Self::start_process(&spec, rows.get(), cols.get());
@@ -240,14 +290,14 @@ impl Pane {
             id,
             project_id,
             slot,
-            command: spec.command,
-            cwd: spec.cwd,
+            spec,
             state: Mutex::new(PaneState {
                 parser,
                 status: PaneStatus::Running,
                 output_seq: 0,
             }),
             process: Mutex::new(None),
+            next_generation: AtomicU64::new(0),
             clients: Mutex::new(HashMap::new()),
             clipboard,
             output,
@@ -256,18 +306,11 @@ impl Pane {
         });
 
         match started {
-            Ok((process, reader)) => {
-                let pgid = {
-                    let child = &process.child;
-                    process
-                        .pgid
-                        .or_else(|| child.process_id().and_then(|pid| i32::try_from(pid).ok()))
-                };
-                let mut process = process;
-                process.pgid = pgid;
+            Ok((mut process, reader)) => {
+                let generation = pane.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                process.generation = generation;
                 *pane.process.lock() = Some(process);
-                pane.spawn_reader(reader);
-                pane.spawn_waiter();
+                pane.spawn_reader(reader, generation);
             }
             Err(err) => {
                 tracing::warn!(
@@ -279,7 +322,65 @@ impl Pane {
                 pane.fail(&err);
             }
         }
+        pane.spawn_waiter();
         pane
+    }
+
+    fn restart_process(self: &Arc<Self>) {
+        if self.is_closed() {
+            return;
+        }
+        let (rows, cols) = self.size();
+        match Self::start_process(&self.spec, rows, cols) {
+            Ok((mut process, reader)) => {
+                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                process.generation = generation;
+                let mut current = self.process.lock();
+                // Use the latest size: a client may have resized the pane while
+                // the new process was starting and there was no PTY to resize.
+                let (rows, cols) = self.size();
+                if let Err(err) = process.master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    tracing::warn!(
+                        pane = self.id.get(),
+                        error = %err,
+                        "could not resize restarted PTY"
+                    );
+                }
+                // Always install the handle so the waiter can reap the child,
+                // including when termination raced with process startup.
+                *current = Some(process);
+                drop(current);
+                self.state.lock().status = PaneStatus::Running;
+                if self.is_closed() {
+                    self.signal(Signal::SIGKILL);
+                    return;
+                }
+                tracing::info!(
+                    pane = self.id.get(),
+                    command = ?self.full_command(),
+                    "restarted pane command"
+                );
+                self.spawn_reader(reader, generation);
+                let _ = self.events.send(SessionEvent::PaneRestarted {
+                    project_id: self.project_id,
+                    pane_id: self.id,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    pane = self.id.get(),
+                    command = ?self.full_command(),
+                    error = %err,
+                    "failed to restart pane"
+                );
+                self.fail(&err);
+            }
+        }
     }
 
     fn start_process(
@@ -316,12 +417,8 @@ impl Pane {
         command.env("TERM_PROGRAM", "mmux");
         command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .with_context(|| format!("could not start `{program}`"))?;
-        drop(pair.slave);
-
+        // Complete all fallible PTY setup before spawning. After this point,
+        // the child is always returned in a Process and owned by the waiter.
         let reader = pair
             .master
             .try_clone_reader()
@@ -330,7 +427,15 @@ impl Pane {
             .master
             .take_writer()
             .context("could not write to PTY")?;
-        let pgid = pair.master.process_group_leader();
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .with_context(|| format!("could not start `{program}`"))?;
+        drop(pair.slave);
+        let pgid = pair
+            .master
+            .process_group_leader()
+            .or_else(|| child.process_id().and_then(|pid| i32::try_from(pid).ok()));
 
         Ok((
             Process {
@@ -338,41 +443,42 @@ impl Pane {
                 writer,
                 child,
                 pgid,
+                generation: 0,
             },
             reader,
         ))
     }
 
-    fn spawn_reader(self: &Arc<Self>, mut reader: Box<dyn Read + Send>) {
+    fn spawn_reader(self: &Arc<Self>, mut reader: Box<dyn Read + Send>, generation: u64) {
         let pane = Arc::clone(self);
-        let name = format!("mmux-reader-{}", self.id.get());
+        let name = format!("mmux-reader-{}-{generation}", self.id.get());
         let spawned = std::thread::Builder::new().name(name).spawn(move || {
             let mut buffer = [0u8; 16 * 1024];
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
-                        let (responses, clipboard, chunk) = {
+                        let (responses, clipboard) = {
                             let mut state = pane.state.lock();
                             state.parser.process(&buffer[..count]);
                             state.output_seq += count as u64;
                             let start = state.output_seq - count as u64 + 1;
+                            let chunk = OutputChunk {
+                                start,
+                                data: Arc::<[u8]>::from(&buffer[..count]),
+                            };
+                            // Keep chunks in sequence-number order when an old
+                            // reader drains while a new generation is running.
+                            let _ = pane.output.send(chunk);
                             let callbacks = state.parser.callbacks_mut();
-                            (
-                                callbacks.take_responses(),
-                                callbacks.take_clipboard(),
-                                OutputChunk {
-                                    start,
-                                    data: Arc::<[u8]>::from(&buffer[..count]),
-                                },
-                            )
+                            (callbacks.take_responses(), callbacks.take_clipboard())
                         };
                         for text in clipboard {
                             let _ = pane.clipboard.send(text);
                         }
-                        let _ = pane.output.send(chunk);
                         if !responses.is_empty()
-                            && let Err(err) = pane.write_input(responses.as_bytes())
+                            && let Err(err) =
+                                pane.write_input_for_generation(generation, responses.as_bytes())
                         {
                             tracing::debug!(
                                 pane = pane.id.get(),
@@ -399,7 +505,17 @@ impl Pane {
                 let mut process = pane.process.lock();
                 match process.as_mut() {
                     Some(process) => process.child.try_wait(),
-                    None => return,
+                    None => {
+                        drop(process);
+                        if pane.is_closed() {
+                            return;
+                        }
+                        std::thread::sleep(RESTART_DELAY);
+                        if !pane.is_closed() {
+                            pane.restart_process();
+                        }
+                        continue;
+                    }
                 }
             };
             match status {
@@ -407,13 +523,13 @@ impl Pane {
                     let signal = status.signal().map(str::to_owned);
                     let code = signal.is_none().then(|| status.exit_code());
                     pane.finish(code, signal);
-                    return;
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                 Err(err) => {
+                    // A wait error is not proof that the child exited. Keep the
+                    // handle and retry rather than starting a duplicate process.
                     tracing::warn!(pane = pane.id.get(), error = %err, "could not wait for pane");
-                    pane.finish(None, None);
-                    return;
+                    std::thread::sleep(RESTART_DELAY);
                 }
             }
         });
@@ -426,11 +542,17 @@ impl Pane {
         let message = format!(
             "\r\nmmux: could not start `{}`\r\n{}: {err}\r\n",
             self.full_command(),
-            self.cwd.display()
+            self.spec.cwd.display()
         );
         {
             let mut state = self.state.lock();
             state.parser.process(message.as_bytes());
+            state.output_seq += message.len() as u64;
+            let start = state.output_seq - message.len() as u64 + 1;
+            let _ = self.output.send(OutputChunk {
+                start,
+                data: Arc::<[u8]>::from(message.as_bytes()),
+            });
             state.status = PaneStatus::Exited {
                 code: None,
                 signal: None,
@@ -472,11 +594,11 @@ impl Pane {
     }
 
     pub fn cwd(&self) -> &PathBuf {
-        &self.cwd
+        &self.spec.cwd
     }
 
     pub fn command(&self) -> &[String] {
-        &self.command
+        &self.spec.command
     }
 
     pub fn status(&self) -> PaneStatus {
@@ -535,14 +657,25 @@ impl Pane {
     }
 
     pub fn write_input(&self, bytes: &[u8]) -> io::Result<()> {
+        self.write_input_inner(None, bytes)
+    }
+
+    fn write_input_for_generation(&self, generation: u64, bytes: &[u8]) -> io::Result<()> {
+        self.write_input_inner(Some(generation), bytes)
+    }
+
+    fn write_input_inner(&self, generation: Option<u64>, bytes: &[u8]) -> io::Result<()> {
         let mut process = self.process.lock();
-        match process.as_mut() {
-            Some(process) => {
-                process.writer.write_all(bytes)?;
-                process.writer.flush()
-            }
-            None => Ok(()),
+        let Some(process) = process.as_mut() else {
+            return Ok(());
+        };
+        // A response produced by an old reader must never be injected into a
+        // replacement process merely because descendants kept its PTY open.
+        if generation.is_some_and(|expected| process.generation != expected) {
+            return Ok(());
         }
+        process.writer.write_all(bytes)?;
+        process.writer.flush()
     }
 
     /// Registers a browser client's desired viewport and returns the new
@@ -623,12 +756,15 @@ impl Pane {
 
     fn signal(&self, signal: Signal) {
         let process = self.process.lock();
-        let Some(process) = process.as_ref() else {
-            return;
-        };
+        if let Some(process) = process.as_ref() {
+            Self::signal_process(self.id, process, signal);
+        }
+    }
+
+    fn signal_process(id: PaneId, process: &Process, signal: Signal) {
         if let Some(pgid) = process.pgid.filter(|pgid| *pgid > 1) {
             if let Err(err) = killpg(Pid::from_raw(pgid), signal) {
-                tracing::debug!(pane = self.id.get(), %pgid, %signal, error = %err, "killpg failed");
+                tracing::debug!(pane = id.get(), %pgid, %signal, error = %err, "killpg failed");
             }
         } else if let Some(pid) = process
             .child
@@ -640,10 +776,10 @@ impl Pane {
     }
 
     fn full_command(&self) -> String {
-        if self.command.is_empty() {
+        if self.spec.command.is_empty() {
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
         } else {
-            self.command.join(" ")
+            self.spec.command.join(" ")
         }
     }
 }
@@ -693,6 +829,7 @@ mod tests {
             command: command.into_iter().map(str::to_owned).collect(),
             env: BTreeMap::new(),
             cwd: cwd.to_path_buf(),
+            appearance: Appearance::Dark,
         }
     }
 
@@ -815,6 +952,43 @@ mod tests {
             "status: {:?}",
             pane.status()
         );
+        pane.kill();
+    }
+
+    #[test]
+    fn restarts_the_same_command_after_it_exits() {
+        let dir = cwd();
+        let marker = dir.path().join("started");
+        let pane = test_pane(
+            vec![
+                "sh",
+                "-c",
+                "if [ -e \"$1\" ]; then printf 'RESTARTED\\n'; sleep 60; fi; touch \"$1\"; exit 0",
+                "mmux-test",
+                marker.to_str().unwrap(),
+            ],
+            dir.path(),
+        );
+        assert!(
+            wait_for(
+                || pane.contents().contains("RESTARTED"),
+                Duration::from_secs(5)
+            ),
+            "contents: {:?}",
+            pane.contents()
+        );
+        assert!(pane.is_running());
+        assert_eq!(
+            pane.command(),
+            &[
+                "sh",
+                "-c",
+                "if [ -e \"$1\" ]; then printf 'RESTARTED\\n'; sleep 60; fi; touch \"$1\"; exit 0",
+                "mmux-test",
+                marker.to_str().unwrap(),
+            ]
+        );
+        pane.kill();
     }
 
     #[test]
@@ -829,6 +1003,7 @@ mod tests {
             pane.status(),
             PaneStatus::Exited { code: None, .. }
         ));
+        pane.kill();
     }
 
     #[test]
@@ -936,6 +1111,30 @@ mod tests {
         );
         assert_eq!(received.as_deref(), Some("hello"));
         pane.kill();
+    }
+
+    #[test]
+    fn answers_osc_color_queries() {
+        let mut parser = Parser::new_with_callbacks(
+            std::num::NonZeroU16::new(24).unwrap(),
+            std::num::NonZeroU16::new(80).unwrap(),
+            0,
+            PaneCallbacks::new(Appearance::Dark),
+        );
+        parser.process(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]4;1;?\x07");
+        let responses = parser.callbacks_mut().take_responses();
+        assert!(
+            responses.contains("\x1b]10;rgb:9393/a1a1/a1a1\x1b\\"),
+            "{responses:?}"
+        );
+        assert!(
+            responses.contains("\x1b]11;rgb:0000/2b2b/3636\x1b\\"),
+            "{responses:?}"
+        );
+        assert!(
+            responses.contains("\x1b]4;1;rgb:dcdc/3232/2f2f\x1b\\"),
+            "{responses:?}"
+        );
     }
 
     #[test]

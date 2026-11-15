@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::config::{PaneConfig, Slot, validate_label};
 use crate::persistence::{self, ProjectRecord};
+use crate::theme::Appearance;
 use pane::{Pane, PaneSpec, PaneStatusView, resolve_command};
 
 /// A project identifier. Unique for the lifetime of the mmux server.
@@ -53,6 +54,10 @@ pub enum SessionEvent {
         project_id: ProjectId,
         pane_id: PaneId,
     },
+    PaneRestarted {
+        project_id: ProjectId,
+        pane_id: PaneId,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -84,6 +89,7 @@ pub struct PaneView {
 pub struct SessionStore {
     template: Vec<PaneConfig>,
     default_size: (u16, u16),
+    appearance: Appearance,
     projects: RwLock<Vec<Project>>,
     events: broadcast::Sender<SessionEvent>,
     next_project: AtomicU64,
@@ -125,6 +131,7 @@ impl SessionStore {
         Self {
             template,
             default_size,
+            appearance: Appearance::default(),
             projects: RwLock::new(Vec::new()),
             events,
             next_project: AtomicU64::new(1),
@@ -132,6 +139,11 @@ impl SessionStore {
             state_path,
             persist_lock: Mutex::new(()),
         }
+    }
+
+    pub fn with_appearance(mut self, appearance: Appearance) -> Self {
+        self.appearance = appearance;
+        self
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
@@ -224,6 +236,7 @@ impl SessionStore {
                         command: resolve_command(&config.command)?,
                         env: config.env.clone(),
                         cwd: cwd.clone(),
+                        appearance: self.appearance,
                     },
                 ))
             })

@@ -8,7 +8,6 @@
   const SERVER_CLIPBOARD = 2;
   const SERVER_DATA = 3;
 
-  const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
   const decoder = new TextDecoder();
   const latin1Decoder = new TextDecoder("latin1");
   // Only queries that mmux answers server-side need their xterm auto-response
@@ -53,6 +52,7 @@
 
   const state = {
     projects: [],
+    appearance: "dark",
     activeProjectId: null,
     user: null,
     root: null,
@@ -142,12 +142,12 @@
   };
 
   function termTheme() {
-    if (darkQuery.matches) {
+    if (state.appearance === "dark") {
       return {
         ...SOLARIZED_ANSI,
         background: SOLARIZED.base03,
-        foreground: SOLARIZED.base0,
-        cursor: SOLARIZED.base0,
+        foreground: SOLARIZED.base1,
+        cursor: SOLARIZED.base1,
         cursorAccent: SOLARIZED.base03,
         selectionBackground: SOLARIZED.base02,
       };
@@ -245,6 +245,14 @@
     state.refreshing = true;
     try {
       const data = await api("api/state");
+      const appearance = data.appearance === "light" ? "light" : "dark";
+      if (state.appearance !== appearance) {
+        state.appearance = appearance;
+        for (const handle of state.handles.values()) {
+          handle.term.options.theme = termTheme();
+        }
+      }
+      applyAppearance();
       state.projects = data.projects;
       state.user = data.user;
       state.root = data.workspace_root;
@@ -268,6 +276,13 @@
         scheduleRefresh(20);
       }
     }
+  }
+
+  function applyAppearance() {
+    const light = state.appearance === "light";
+    document.documentElement.classList.toggle("theme-light", light);
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", light ? "#fdf6e3" : "#002b36");
   }
 
   function scheduleRefresh(delay = 60) {
@@ -492,6 +507,8 @@
       slot: pane.slot,
       queryTail: "",
       pendingResponses: { cpr: 0, status: 0, da: 0 },
+      prefixPending: false,
+      prefixTimer: null,
       scheduleFit: () => {},
       mount: () => {},
       dispose: () => {},
@@ -516,6 +533,37 @@
     });
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
+
+      // Browser-reserved shortcuts such as Ctrl+T/Ctrl+W cannot be captured
+      // by web content. Use Ctrl+Shift+Space as a prefix, then press the key
+      // without Ctrl: prefix + T sends Ctrl+T to the program.
+      if (event.ctrlKey && event.shiftKey && !event.altKey && event.code === "Space") {
+        event.preventDefault();
+        event.stopPropagation();
+        handle.prefixPending = !handle.prefixPending;
+        window.clearTimeout(handle.prefixTimer);
+        if (handle.prefixPending) {
+          showToast("Ctrl prefix: press a key");
+          handle.prefixTimer = window.setTimeout(() => {
+            handle.prefixPending = false;
+          }, 2000);
+        } else {
+          showToast("Ctrl prefix cancelled");
+        }
+        return false;
+      }
+
+      if (handle.prefixPending) {
+        event.preventDefault();
+        event.stopPropagation();
+        handle.prefixPending = false;
+        window.clearTimeout(handle.prefixTimer);
+        if (event.code !== "Escape" && !event.altKey && !event.metaKey) {
+          const byte = controlByte(event);
+          if (byte !== null) sendFrame(CLIENT_INPUT, Uint8Array.of(byte));
+        }
+        return false;
+      }
 
       // Pane focus navigation. Prevent the browser from treating these as
       // text-selection shortcuts and keep the chord away from the program.
@@ -651,6 +699,7 @@
     handle.dispose = () => {
       if (handle.disposed) return;
       handle.disposed = true;
+      window.clearTimeout(handle.prefixTimer);
       window.clearTimeout(handle.retryTimer);
       window.cancelAnimationFrame(handle.fitRaf);
       if (handle.ro) handle.ro.disconnect();
@@ -703,6 +752,19 @@
       return true;
     }
     return false;
+  }
+
+  function controlByte(event) {
+    if (event.code === "Space") return 0x00;
+    if (event.code === "BracketLeft") return 0x1b;
+    if (event.code === "Backslash") return 0x1c;
+    if (event.code === "BracketRight") return 0x1d;
+    if (event.code === "Digit6" && event.shiftKey) return 0x1e;
+    if (event.code === "Minus" && event.shiftKey) return 0x1f;
+    if (event.code === "Slash" && event.shiftKey) return 0x7f;
+    const letter = /^Key([A-Z])$/.exec(event.code);
+    if (letter) return letter[1].charCodeAt(0) - 64;
+    return null;
   }
 
   function activePaneHandle() {
@@ -876,11 +938,6 @@
 
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && state.events) scheduleRefresh(0);
-  });
-
-  darkQuery.addEventListener("change", () => {
-    const theme = termTheme();
-    for (const handle of state.handles.values()) handle.term.options.theme = theme;
   });
 
   refresh();

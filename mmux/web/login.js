@@ -7,6 +7,16 @@
   const error = document.getElementById("login-error");
   const submit = document.getElementById("login-submit");
 
+  fetch("api/theme", { credentials: "same-origin" })
+    .then((response) => (response.ok ? response.json() : null))
+    .then((theme) => {
+      if (!theme || theme.appearance !== "light") return;
+      document.documentElement.classList.add("theme-light");
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute("content", "#fdf6e3");
+    })
+    .catch(() => {});
+
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     error.hidden = true;

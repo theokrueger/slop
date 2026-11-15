@@ -18,6 +18,10 @@ the same panes.
   (`Ctrl+C` without a selection is still sent as SIGINT); OSC 52 copies from
   programs are forwarded to the browser clipboard
 - `Ctrl+Shift+Arrow` moves focus between panes (up, down, left, right)
+- Browser-reserved Ctrl shortcuts (Ctrl+T, Ctrl+W, Ctrl+N, ...) cannot be
+  captured by a web page. Use the mmux Ctrl prefix: `Ctrl+Shift+Space`, then
+  the key without Ctrl. For example, `Ctrl+Shift+Space`, `T` sends Ctrl+T to
+  pi. The prefix lasts two seconds.
 - Paste with `Ctrl+Shift+V` or `Shift+Insert`; right-click also works
 - Some browsers reserve `Ctrl+Shift+C` for DevTools. mmux intercepts it in the
   capture phase; if your browser still handles it first, use `Ctrl+Insert` or
@@ -26,7 +30,7 @@ the same panes.
 - Server-side terminal emulation with reconnect snapshots and incremental
   screen diffs
 - Small, dependency-light frontend; xterm.js is vendored, no CDN required
-- Solarized light and dark palettes for both the UI and terminal
+- Fixed Solarized appearance (`dark` or `light`) for the UI and terminal
 - Relative URLs, so it can be mounted behind a path-prefix reverse proxy
 
 The default new-project layout is two `pi` sessions on the left,
@@ -54,8 +58,8 @@ cargo build --release
 install -Dm755 target/release/mmux ~/.local/bin/mmux
 
 # Optional: write the documented defaults, then edit them.
-mkdir -p ~/.config/mmux
-mmux --print-default-config > ~/.config/mmux/config.toml
+mkdir -p ~/.config
+mmux --print-default-config > ~/.config/mmux.toml
 
 mmux
 ```
@@ -64,7 +68,7 @@ Open <http://127.0.0.1:8787> and sign in with the password of the Unix account
 that runs mmux. mmux always spawns panes as that account; it refuses to
 authenticate any other user.
 
-Configuration is read from `$XDG_CONFIG_HOME/mmux/config.toml` by default.
+Configuration is read from `~/.config/mmux.toml` by default.
 `--config PATH` and `MMUX_CONFIG` select another file. `--bind ADDR` and
 `MMUX_BIND` override the listen address.
 
@@ -88,7 +92,7 @@ resume their conversation history because the resolved
 placeholder existed keep their original commands; if they are pi sessions,
 resume them manually with `pi --resume` or recreate the project. If a saved
 directory or command no longer exists, the project is still restored and the
-affected pane shows its startup error.
+affected pane reports the startup error and keeps retrying.
 
 Delete the state file to start with no projects.
 
@@ -98,6 +102,8 @@ Delete the state file to start with no projects.
   browser WebSocket is only a viewer.
 - Disconnecting all browsers pauses nothing. Reconnecting (or opening a second
   browser) replays the current screen.
+- When a pane's command exits, mmux starts a new instance of the same command
+  after a short delay. Closing the project or stopping mmux does not restart it.
 - Restarting mmux ends the running processes, but restores the persisted
   projects and starts their panes again.
 - Multiple browsers share input and output for a pane, like attaching to the
@@ -126,6 +132,7 @@ root = "~"               # directory picker confinement
 [terminal]
 rows = 30
 cols = 100
+appearance = "dark"    # "dark" or "light"
 
 # Used for every newly created project. Projects are created from the UI in
 # the directory chosen there, and persisted for the next mmux start.
@@ -150,6 +157,10 @@ command = []
   Unused slots are omitted and the grid collapses accordingly.
 - An omitted or empty `command` starts `$SHELL`.
 - `env` adds per-pane environment variables.
+- `terminal.appearance` is fixed to `dark` or `light` rather than following
+  each browser. Panes can start before a browser connects, and TUI programs
+  query terminal colors at startup, so a single reported palette keeps their
+  colors and backgrounds consistent.
 - `{session_id}` is replaced once per pane when a project is created with a
   fresh UUID. The resolved command is stored with the project, so programs that
   accept a stable session ID can resume after a restart. The default `pi`

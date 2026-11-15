@@ -1,6 +1,6 @@
 # mmux configuration
 #
-# Default location: $XDG_CONFIG_HOME/mmux/config.toml
+# Default location: ~/.config/mmux.toml
 # Every setting below shows its built-in default.
 
 [server]
@@ -28,6 +28,9 @@ root = "~"
 # Initial pane size, until a browser viewport negotiates its own size.
 rows = 30
 cols = 100
+# Fixed Solarized appearance for the UI and terminals: "dark" or "light".
+# This is reported to programs at startup so TUI backgrounds render correctly.
+appearance = "dark"
 
 # Every new project starts this set of panes, in the directory chosen in the
 # browser. Projects are created on demand and persisted under
@@ -38,7 +41,8 @@ cols = 100
 # created, and the resolved command is saved with the project. The default pi
 # panes therefore resume their session after a restart. Commands without the
 # placeholder are left untouched.
-# An empty `command` starts the user's $SHELL. Four slots are available:
+# Commands are restarted after they exit. An empty `command` starts the user's
+# $SHELL. Four slots are available:
 # top-left, top-right, bottom-left, bottom-right. Omitted slots stay empty.
 
 [[new_project.panes]]

@@ -14,12 +14,14 @@ use tower_sessions::Session;
 
 use super::{AppState, AuthUser, MMUX_HEADER, SESSION_USER};
 use crate::session::{ProjectId, ProjectView, SessionError, SessionEvent};
+use crate::theme::Appearance;
 use crate::workspace::WorkspaceError;
 
 #[derive(Debug, Serialize)]
 pub struct SessionView {
     pub user: String,
     pub workspace_root: String,
+    pub appearance: Appearance,
     pub projects: Vec<ProjectView>,
 }
 
@@ -27,6 +29,7 @@ pub async fn state(State(state): State<AppState>, AuthUser(user): AuthUser) -> J
     Json(SessionView {
         user,
         workspace_root: state.workspace.root().to_string_lossy().into_owned(),
+        appearance: state.config.terminal.appearance,
         projects: state.sessions.snapshot().await,
     })
 }
@@ -51,6 +54,18 @@ pub async fn events(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     )
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ThemeView {
+    pub appearance: Appearance,
+}
+
+/// Public appearance for the login page, which has no session yet.
+pub async fn theme(State(state): State<AppState>) -> Json<ThemeView> {
+    Json(ThemeView {
+        appearance: state.config.terminal.appearance,
+    })
 }
 
 #[derive(Debug, Deserialize)]

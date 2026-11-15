@@ -99,6 +99,7 @@ pub fn router(state: AppState) -> Router {
         .route("/login", login_routes)
         .route("/logout", post(logout))
         .route("/healthz", get(health))
+        .route("/api/theme", get(api::theme))
         .route("/assets/{*path}", get(asset))
         .route("/api/state", get(api::state))
         .route("/api/events", get(api::events))

@@ -8,5 +8,6 @@ pub mod auth;
 pub mod config;
 pub mod persistence;
 pub mod session;
+pub mod theme;
 pub mod web;
 pub mod workspace;

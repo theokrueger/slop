@@ -1,8 +1,30 @@
 :root {
+  color-scheme: dark;
+  --bg: #002b36;
+  --panel: #073642;
+  --fg: #eee8d5;
+  --muted: #586e75;
+  --button-bg: #93a1a1;
+  --button-fg: #002b36;
+  --border: #14505c;
+  --hover: #0b3a46;
+  --active: #12414d;
+  --danger: #dc322f;
+  --pane-focus: #d33682;
+  --term-bg: #002b36;
+  --shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+:root.theme-light {
+  color-scheme: light;
   --bg: #fdf6e3;
   --panel: #eee8d5;
   --fg: #586e75;
   --muted: #93a1a1;
+  --button-bg: #586e75;
+  --button-fg: #fdf6e3;
   --border: #d9d2bf;
   --hover: #e7e0cd;
   --active: #dfd8c4;
@@ -10,24 +32,6 @@
   --pane-focus: #d33682;
   --term-bg: #fdf6e3;
   --shadow: 0 12px 40px rgba(0, 43, 54, 0.16);
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #002b36;
-    --panel: #073642;
-    --fg: #93a1a1;
-    --muted: #586e75;
-    --border: #14505c;
-    --hover: #0b3a46;
-    --active: #12414d;
-    --danger: #dc322f;
-    --pane-focus: #d33682;
-    --term-bg: #002b36;
-    --shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
-  }
 }
 
 * {
@@ -316,9 +320,9 @@ button {
 }
 
 .button.primary {
-  border-color: var(--fg);
-  background: var(--fg);
-  color: var(--bg);
+  border-color: var(--button-bg);
+  background: var(--button-bg);
+  color: var(--button-fg);
 }
 
 .button.primary:hover {

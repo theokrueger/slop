@@ -21,7 +21,7 @@ use mmux::workspace::Workspace;
     about = "A persistent web terminal multiplexer for agents"
 )]
 struct Cli {
-    /// Path to a TOML config file (default: $XDG_CONFIG_HOME/mmux/config.toml).
+    /// Path to a TOML config file (default: ~/.config/mmux.toml).
     #[arg(long, env = "MMUX_CONFIG", value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -63,20 +63,23 @@ async fn run(config: Config) -> anyhow::Result<()> {
             .context("could not configure PAM")?,
     );
     let state_path = persistence::default_state_path();
-    let sessions = Arc::new(match state_path.as_ref() {
-        Some(path) => SessionStore::with_state_file(
-            config.new_project.panes.clone(),
-            (config.terminal.rows, config.terminal.cols),
-            path.clone(),
-        ),
-        None => {
-            tracing::warn!("could not determine a state directory; projects will not persist");
-            SessionStore::new(
+    let sessions = Arc::new(
+        match state_path.as_ref() {
+            Some(path) => SessionStore::with_state_file(
                 config.new_project.panes.clone(),
                 (config.terminal.rows, config.terminal.cols),
-            )
+                path.clone(),
+            ),
+            None => {
+                tracing::warn!("could not determine a state directory; projects will not persist");
+                SessionStore::new(
+                    config.new_project.panes.clone(),
+                    (config.terminal.rows, config.terminal.cols),
+                )
+            }
         }
-    });
+        .with_appearance(config.terminal.appearance),
+    );
     if let Some(path) = state_path.as_ref() {
         tracing::info!(state = %path.display(), "project persistence enabled");
     }

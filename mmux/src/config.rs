@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::theme::Appearance;
+
 /// The canonical default configuration, also used by `mmux --print-default-config`.
 pub const DEFAULT_CONFIG_TOML: &str = include_str!("../config.example.toml");
 
@@ -25,7 +27,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Loads the configuration from `path`, or from the default XDG location
+    /// Loads the configuration from `path`, or from `~/.config/mmux.toml`
     /// when one exists. Without a config file, mmux uses sensible defaults.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         match path {
@@ -52,10 +54,9 @@ impl Config {
         Ok(config)
     }
 
-    /// The default config location: `$XDG_CONFIG_HOME/mmux/config.toml`.
+    /// The default config location: `~/.config/mmux.toml`.
     pub fn default_path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("", "", "mmux")
-            .map(|dirs| dirs.config_dir().join("config.toml"))
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".config").join("mmux.toml"))
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -187,6 +188,11 @@ pub struct TerminalConfig {
     /// Initial pane size before a client negotiates its viewport.
     pub rows: u16,
     pub cols: u16,
+    /// Fixed UI and terminal appearance. Applications query terminal colors at
+    /// startup, before a browser may be connected, so this cannot follow the
+    /// browser's light/dark preference per client.
+    #[serde(default)]
+    pub appearance: Appearance,
 }
 
 impl Default for TerminalConfig {
@@ -194,6 +200,7 @@ impl Default for TerminalConfig {
         Self {
             rows: DEFAULT_ROWS,
             cols: DEFAULT_COLS,
+            appearance: Appearance::Dark,
         }
     }
 }
