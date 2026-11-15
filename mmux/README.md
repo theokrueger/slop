@@ -11,6 +11,12 @@ the same panes.
 - A new tab starts the configured pane template in a working directory chosen
   through an interactive directory picker
 - No tabs are open on startup
+- Copy with `Ctrl+Insert`, or `Ctrl+C` when text is selected (`Ctrl+C` without
+  a selection is still sent as SIGINT); OSC 52 copies from programs are
+  forwarded to the browser clipboard
+- Paste with `Ctrl+Shift+V` or `Shift+Insert`; right-click also works
+- `Ctrl+Shift+C` is used by browser DevTools in Chrome/Firefox, so the
+  shortcuts above are the reliable ones
 - Linux username/password login through PAM; no mmux-specific accounts
 - Server-side terminal emulation with reconnect snapshots and incremental
   screen diffs
@@ -92,22 +98,18 @@ cols = 100
 # directory chosen there; they are not created at startup.
 [[new_tab.panes]]
 slot = "top-left"
-name = "pi"
 command = ["pi"]
 
 [[new_tab.panes]]
 slot = "bottom-left"
-name = "pi"
 command = ["pi"]
 
 [[new_tab.panes]]
 slot = "top-right"
-name = "emacs"
 command = ["emacs", "-nw"]
 
 [[new_tab.panes]]
 slot = "bottom-right"
-name = "shell"
 command = []
 ```
 

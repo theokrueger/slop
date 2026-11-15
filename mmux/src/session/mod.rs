@@ -70,7 +70,6 @@ pub struct TabView {
 #[derive(Debug, Clone, Serialize)]
 pub struct PaneView {
     pub id: PaneId,
-    pub name: String,
     pub slot: Slot,
     pub status: PaneStatusView,
     pub command: String,
@@ -126,7 +125,6 @@ impl SessionStore {
             specs.push((
                 config.slot,
                 PaneSpec {
-                    name: config.display_name(),
                     command: resolve_command(&config.command)?,
                     env: config.env.clone(),
                     cwd: cwd.clone(),
@@ -253,7 +251,6 @@ impl Pane {
         };
         PaneView {
             id: self.id(),
-            name: self.name().to_owned(),
             slot: self.slot(),
             status: self.status().view(),
             command,
@@ -301,7 +298,6 @@ mod tests {
     fn template(command: Vec<&str>) -> Vec<PaneConfig> {
         vec![PaneConfig {
             slot: Slot::TopLeft,
-            name: Some("test".into()),
             command: command.into_iter().map(str::to_owned).collect(),
             env: BTreeMap::new(),
         }]
@@ -406,7 +402,9 @@ mod tests {
     #[tokio::test]
     async fn broadcasts_tab_changes() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = store(vec!["sleep", "10"]);
+        // No pane template: this test only observes tab-level events, and
+        // avoids depending on PTY spawn timing under parallel test load.
+        let store = SessionStore::new(Vec::new(), (24, 80));
         let mut events = store.subscribe();
         let view = store
             .create_tab(None, dir.path().to_path_buf())

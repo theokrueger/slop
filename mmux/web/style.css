@@ -9,8 +9,6 @@
   --accent: #155eef;
   --accent-fg: #ffffff;
   --danger: #b42318;
-  --ok: #1a7f37;
-  --warn: #9a6700;
   --term-bg: #ffffff;
   --shadow: 0 12px 40px rgba(16, 24, 40, 0.16);
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
@@ -29,8 +27,6 @@
     --accent: #5b8cff;
     --accent-fg: #07101f;
     --danger: #ff8d85;
-    --ok: #57c785;
-    --warn: #e3b341;
     --term-bg: #0d0f12;
     --shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
   }
@@ -253,47 +249,6 @@ button {
   overflow: hidden;
 }
 
-.pane-header {
-  flex: none;
-  height: 27px;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 0 8px;
-  border-bottom: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 12px;
-  user-select: none;
-}
-
-.pane-title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dot {
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--muted);
-}
-
-.dot.running,
-.dot.connected {
-  background: var(--ok);
-}
-
-.dot.exited {
-  background: var(--danger);
-}
-
-.dot.reconnecting,
-.dot.connecting {
-  background: var(--warn);
-}
-
 .pane-term {
   flex: 1;
   min-height: 0;
@@ -475,6 +430,42 @@ button {
   justify-content: flex-end;
   gap: 8px;
   padding-top: 2px;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 32px);
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  font-size: 13px;
+}
+
+.toast[hidden] {
+  display: none;
+}
+
+.toast-action {
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--hover);
+  color: var(--fg);
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.toast-action:hover {
+  border-color: var(--accent);
 }
 
 .login-body {

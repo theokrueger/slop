@@ -78,7 +78,6 @@ impl TestApp {
     fn default_template() -> Vec<PaneConfig> {
         vec![PaneConfig {
             slot: Slot::TopLeft,
-            name: Some("shell".into()),
             command: vec!["sh".into()],
             env: BTreeMap::new(),
         }]
@@ -530,6 +529,29 @@ async fn websocket_attaches_to_shared_terminal_state() {
     assert!(
         marker_seen,
         "terminal output never contained marker: {transcript:?}"
+    );
+
+    // OSC 52 clipboard writes from the program are forwarded to the browser.
+    let mut osc52 = vec![1u8];
+    osc52.extend_from_slice(b"printf '\\033]52;c;TU1VWF9DTElQ\\a'\n");
+    socket.send(Message::Binary(osc52.into())).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut clipboard = None;
+    while tokio::time::Instant::now() < deadline {
+        let frame = match tokio::time::timeout_at(deadline, socket.next()).await {
+            Ok(Some(Ok(Message::Binary(frame)))) => frame,
+            _ => break,
+        };
+        if frame.first() == Some(&2) {
+            clipboard = Some(String::from_utf8_lossy(&frame[1..]).into_owned());
+            break;
+        }
+    }
+    assert_eq!(
+        clipboard.as_deref(),
+        Some("MMUX_CLIP"),
+        "OSC 52 clipboard write was not forwarded"
     );
 
     let _ = socket.close(None).await;

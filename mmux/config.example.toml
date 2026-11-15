@@ -36,20 +36,16 @@ cols = 100
 
 [[new_tab.panes]]
 slot = "top-left"
-name = "pi"
 command = ["pi"]
 
 [[new_tab.panes]]
 slot = "bottom-left"
-name = "pi"
 command = ["pi"]
 
 [[new_tab.panes]]
 slot = "top-right"
-name = "emacs"
 command = ["emacs", "-nw"]
 
 [[new_tab.panes]]
 slot = "bottom-right"
-name = "shell"
 command = []

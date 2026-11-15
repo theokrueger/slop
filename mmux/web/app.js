@@ -6,8 +6,10 @@
   const CLIENT_INPUT = 1;
   const SERVER_FULL = 0;
   const SERVER_DIFF = 1;
+  const SERVER_CLIPBOARD = 2;
 
   const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+  const decoder = new TextDecoder();
 
   const els = {
     loading: document.getElementById("loading"),
@@ -29,6 +31,7 @@
     dialogError: document.getElementById("dialog-error"),
     dialogCancel: document.getElementById("dialog-cancel"),
     dialogCreate: document.getElementById("dialog-create"),
+    toast: document.getElementById("toast"),
   };
 
   const state = {
@@ -99,6 +102,80 @@
       cursor: "#1b1f24",
       selectionBackground: "#d9e4f5",
     };
+  }
+
+  let toastTimer = 0;
+
+  function showToast(message, action) {
+    window.clearTimeout(toastTimer);
+    els.toast.replaceChildren();
+    const label = document.createElement("span");
+    label.textContent = message;
+    els.toast.append(label);
+    if (action) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "toast-action";
+      button.textContent = action.label;
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        action.run();
+      });
+      els.toast.append(button);
+    }
+    els.toast.hidden = false;
+    toastTimer = window.setTimeout(() => {
+      els.toast.hidden = true;
+    }, action ? 10000 : 1800);
+  }
+
+  async function writeClipboard(text) {
+    if (!text) return false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      // Fall back to the legacy copy path below.
+    }
+
+    const active = document.activeElement;
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.top = "-1000px";
+    area.style.left = "-1000px";
+    document.body.append(area);
+    area.select();
+    area.setSelectionRange(0, area.value.length);
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    }
+    area.remove();
+    if (active && typeof active.focus === "function") {
+      active.focus({ preventScroll: true });
+    }
+    return copied;
+  }
+
+  async function copyText(text) {
+    if (!text) return false;
+    if (await writeClipboard(text)) {
+      showToast("Copied to clipboard");
+      return true;
+    }
+    showToast("Clipboard write was blocked.", {
+      label: "Copy",
+      run: () => {
+        void copyText(text);
+      },
+    });
+    return false;
   }
 
   async function refresh() {
@@ -300,12 +377,11 @@
     for (const pane of tab.panes) {
       let handle = state.handles.get(String(pane.id));
       if (!handle) {
-        handle = createPane(pane, tab);
+        handle = createPane(pane);
         state.handles.set(String(pane.id), handle);
         els.panes.append(handle.el);
         handle.mount();
       }
-      handle.update(pane, tab);
       const row = !hasBottom || pane.slot.startsWith("top") ? 1 : 2;
       const col = !hasRight || pane.slot.endsWith("left") ? 1 : 2;
       handle.el.style.gridRow = String(row);
@@ -321,19 +397,9 @@
     els.panes.replaceChildren();
   }
 
-  function createPane(pane, tab) {
+  function createPane(pane) {
     const el = document.createElement("section");
     el.className = "pane";
-
-    const header = document.createElement("div");
-    header.className = "pane-header";
-    const dot = document.createElement("span");
-    dot.className = "dot connecting";
-    dot.title = "connecting";
-    const title = document.createElement("span");
-    title.className = "pane-title";
-    header.append(dot, title);
-    el.append(header);
 
     const host = document.createElement("div");
     host.className = "pane-term";
@@ -361,14 +427,9 @@
       retry: 0,
       disposed: false,
       mounted: false,
-      connected: false,
-      reconnecting: false,
       lastSentSize: "",
       fitRaf: 0,
-      pane,
-      tab,
-      renderHeader: () => {},
-      update: () => {},
+      paneId: pane.id,
       scheduleFit: () => {},
       mount: () => {},
       dispose: () => {},
@@ -389,53 +450,30 @@
       sendFrame(CLIENT_INPUT, bytes);
     });
     term.attachCustomKeyEventHandler((event) => {
-      if (event.type !== "keydown" || !event.ctrlKey || !event.shiftKey) return true;
-      if (event.code === "KeyC" && term.hasSelection()) {
-        if (navigator.clipboard) navigator.clipboard.writeText(term.getSelection()).catch(() => {});
+      if (event.type !== "keydown") return true;
+
+      // Ctrl+Shift+C is reserved by some browsers (DevTools), so also support
+      // Ctrl+Insert and Ctrl+C when a selection exists. Plain Ctrl+C with no
+      // selection still reaches the program as SIGINT.
+      const copyChord =
+        (event.ctrlKey && !event.shiftKey && !event.altKey
+          && (event.code === "KeyC" || event.code === "Insert"))
+        || (event.ctrlKey && event.shiftKey && !event.altKey && event.code === "KeyC");
+      if (copyChord && term.hasSelection()) {
+        void copyText(term.getSelection());
         return false;
       }
-      if (event.code === "KeyV") {
-        if (navigator.clipboard) {
-          navigator.clipboard
-            .readText()
-            .then((text) => {
-              if (text) term.paste(text);
-            })
-            .catch(() => {});
-        }
-        return false;
-      }
+
+      // Let the browser deliver its native paste event. Returning false only
+      // stops xterm from turning the shortcut into terminal input; the event's
+      // default action must stay intact. Do not call
+      // navigator.clipboard.readText() here: Firefox renders that as a paste
+      // context menu instead of pasting directly.
+      if (event.ctrlKey && event.shiftKey && event.code === "KeyV") return false;
+      if (event.shiftKey && event.code === "Insert") return false;
+
       return true;
     });
-
-    handle.renderHeader = () => {
-      const exited = handle.pane.status && handle.pane.status.state === "exited";
-      let cls = "connecting";
-      let label = "connecting";
-      if (exited) {
-        cls = "exited";
-        const status = handle.pane.status;
-        if (status.signal) label = `exited (${status.signal})`;
-        else if (status.code !== null && status.code !== undefined) label = `exited (${status.code})`;
-        else label = "exited";
-      } else if (handle.connected) {
-        cls = "connected";
-        label = "connected";
-      } else if (handle.reconnecting) {
-        cls = "reconnecting";
-        label = "reconnecting";
-      }
-      dot.className = `dot ${cls}`;
-      dot.title = label;
-      title.textContent = handle.pane.name;
-      header.title = `${handle.pane.command}\n${handle.tab.cwd}`;
-    };
-
-    handle.update = (nextPane, nextTab) => {
-      handle.pane = nextPane;
-      handle.tab = nextTab;
-      handle.renderHeader();
-    };
 
     const sendSize = () => {
       if (!handle.ws || handle.ws.readyState !== WebSocket.OPEN) return;
@@ -471,10 +509,8 @@
     const connect = () => {
       if (handle.disposed) return;
       window.clearTimeout(handle.retryTimer);
-      handle.reconnecting = handle.retry > 0;
-      handle.renderHeader();
       const base = new URL("./", window.location.href);
-      const wsUrl = new URL(`ws/panes/${handle.pane.id}`, base);
+      const wsUrl = new URL(`ws/panes/${handle.paneId}`, base);
       wsUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(wsUrl);
       ws.binaryType = "arraybuffer";
@@ -485,11 +521,8 @@
           ws.close();
           return;
         }
-        handle.connected = true;
-        handle.reconnecting = false;
         handle.retry = 0;
         handle.lastSentSize = "";
-        handle.renderHeader();
         handle.scheduleFit();
       };
 
@@ -508,15 +541,14 @@
           term.write(payload);
         } else if (opcode === SERVER_DIFF) {
           term.write(new Uint8Array(data, 1));
+        } else if (opcode === SERVER_CLIPBOARD) {
+          void copyText(decoder.decode(new Uint8Array(data, 1)));
         }
       };
 
       ws.onclose = () => {
-        handle.connected = false;
         handle.ws = null;
         if (handle.disposed) return;
-        handle.reconnecting = true;
-        handle.renderHeader();
         const delay = Math.min(5000, 400 * 1.7 ** handle.retry);
         handle.retry += 1;
         handle.retryTimer = window.setTimeout(connect, delay);
@@ -550,7 +582,6 @@
     };
 
     host.addEventListener("mousedown", () => term.focus());
-    header.addEventListener("mousedown", () => term.focus());
 
     return handle;
   }

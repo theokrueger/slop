@@ -86,10 +86,6 @@ impl Config {
                     pane.slot
                 ));
             }
-            if let Some(name) = &pane.name {
-                validate_label(name)
-                    .map_err(|err| format!("new_tab.panes[{index}].name: {err}"))?;
-            }
             if let Some(program) = pane.command.first() {
                 if program.is_empty() {
                     return Err(format!(
@@ -221,36 +217,12 @@ impl Default for NewTabConfig {
 #[serde(deny_unknown_fields)]
 pub struct PaneConfig {
     pub slot: Slot,
-    /// Label shown above the pane. Defaults to the command's basename.
-    #[serde(default)]
-    pub name: Option<String>,
     /// Program and arguments. An empty list starts `$SHELL`.
     #[serde(default)]
     pub command: Vec<String>,
     /// Extra environment variables for this pane.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-}
-
-impl PaneConfig {
-    pub fn display_name(&self) -> String {
-        if let Some(name) = self
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-        {
-            return name.to_owned();
-        }
-        match self.command.first() {
-            Some(program) => Path::new(program)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(program)
-                .to_owned(),
-            None => "shell".to_owned(),
-        }
-    }
 }
 
 /// One of the four cells of the pane grid.
@@ -287,25 +259,21 @@ fn default_panes() -> Vec<PaneConfig> {
     vec![
         PaneConfig {
             slot: Slot::TopLeft,
-            name: Some("pi".into()),
             command: vec!["pi".into()],
             env: BTreeMap::new(),
         },
         PaneConfig {
             slot: Slot::BottomLeft,
-            name: Some("pi".into()),
             command: vec!["pi".into()],
             env: BTreeMap::new(),
         },
         PaneConfig {
             slot: Slot::TopRight,
-            name: Some("emacs".into()),
             command: vec!["emacs".into(), "-nw".into()],
             env: BTreeMap::new(),
         },
         PaneConfig {
             slot: Slot::BottomRight,
-            name: Some("shell".into()),
             command: Vec::new(),
             env: BTreeMap::new(),
         },
@@ -349,17 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_control_characters_in_names() {
-        let text = r#"
-            [[new_tab.panes]]
-            slot = "top-left"
-            name = "bad\nname"
-        "#;
-        let err = Config::from_toml(text).unwrap_err().to_string();
-        assert!(err.contains("control characters"), "{err}");
-    }
-
-    #[test]
     fn unknown_keys_are_rejected() {
         let err = format!(
             "{:#}",
@@ -369,14 +326,14 @@ mod tests {
     }
 
     #[test]
-    fn pane_display_name_prefers_configured_name() {
-        let pane = PaneConfig {
-            slot: Slot::TopLeft,
-            name: None,
-            command: vec!["/usr/bin/emacs".into(), "-nw".into()],
-            env: BTreeMap::new(),
-        };
-        assert_eq!(pane.display_name(), "emacs");
+    fn pane_names_are_no_longer_configurable() {
+        let text = r#"
+            [[new_tab.panes]]
+            slot = "top-left"
+            name = "legacy"
+        "#;
+        let err = format!("{:#}", Config::from_toml(text).unwrap_err());
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]

@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD as BASE64, STANDARD_NO_PAD as BASE64_NO_PAD};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 use parking_lot::Mutex;
@@ -25,7 +27,6 @@ pub const MAX_COLS: u16 = 1000;
 /// Everything needed to start a pane.
 #[derive(Debug, Clone)]
 pub struct PaneSpec {
-    pub name: String,
     pub command: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
@@ -86,12 +87,12 @@ pub struct Pane {
     id: PaneId,
     tab_id: TabId,
     slot: Slot,
-    name: String,
     command: Vec<String>,
     cwd: PathBuf,
     state: Mutex<PaneState>,
     process: Mutex<Option<Process>>,
     clients: Mutex<HashMap<u64, ClientSize>>,
+    clipboard: broadcast::Sender<String>,
     closed: AtomicBool,
     events: broadcast::Sender<SessionEvent>,
 }
@@ -108,11 +109,16 @@ struct PaneState {
 #[derive(Debug, Default)]
 struct PaneCallbacks {
     responses: String,
+    clipboard: Vec<String>,
 }
 
 impl PaneCallbacks {
     fn take_responses(&mut self) -> String {
         std::mem::take(&mut self.responses)
+    }
+
+    fn take_clipboard(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.clipboard)
     }
 
     fn cursor_report(&mut self, screen: &Screen, private: bool) {
@@ -127,6 +133,22 @@ impl PaneCallbacks {
 }
 
 impl Callbacks for PaneCallbacks {
+    fn copy_to_clipboard(&mut self, _screen: &mut Screen, _ty: &[u8], data: &[u8]) {
+        if data.len() > 1_000_000 {
+            return;
+        }
+        let decoded = BASE64.decode(data).or_else(|_| BASE64_NO_PAD.decode(data));
+        let Ok(decoded) = decoded else {
+            return;
+        };
+        let Ok(text) = String::from_utf8(decoded) else {
+            return;
+        };
+        if !text.is_empty() {
+            self.clipboard.push(text);
+        }
+    }
+
     fn unhandled_csi(
         &mut self,
         screen: &mut Screen,
@@ -200,12 +222,12 @@ impl Pane {
     ) -> Arc<Self> {
         let (rows, cols) = sanitize_size(size.0, size.1);
         let parser = Parser::new_with_callbacks(rows, cols, 0, PaneCallbacks::default());
+        let (clipboard, _) = broadcast::channel(64);
         let started = Self::start_process(&spec, rows.get(), cols.get());
         let pane = Arc::new(Self {
             id,
             tab_id,
             slot,
-            name: spec.name,
             command: spec.command,
             cwd: spec.cwd,
             state: Mutex::new(PaneState {
@@ -214,6 +236,7 @@ impl Pane {
             }),
             process: Mutex::new(None),
             clients: Mutex::new(HashMap::new()),
+            clipboard,
             closed: AtomicBool::new(false),
             events,
         });
@@ -315,11 +338,15 @@ impl Pane {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
-                        let responses = {
+                        let (responses, clipboard) = {
                             let mut state = pane.state.lock();
                             state.parser.process(&buffer[..count]);
-                            state.parser.callbacks_mut().take_responses()
+                            let callbacks = state.parser.callbacks_mut();
+                            (callbacks.take_responses(), callbacks.take_clipboard())
                         };
+                        for text in clipboard {
+                            let _ = pane.clipboard.send(text);
+                        }
                         if !responses.is_empty()
                             && let Err(err) = pane.write_input(responses.as_bytes())
                         {
@@ -420,10 +447,6 @@ impl Pane {
         self.slot
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     pub fn cwd(&self) -> &PathBuf {
         &self.cwd
     }
@@ -486,6 +509,11 @@ impl Pane {
                 screen: screen.clone(),
             })
         }
+    }
+
+    /// Clipboard writes requested by the pane's program via OSC 52.
+    pub fn subscribe_clipboard(&self) -> broadcast::Receiver<String> {
+        self.clipboard.subscribe()
     }
 
     pub fn write_input(&self, bytes: &[u8]) -> io::Result<()> {
@@ -644,7 +672,6 @@ mod tests {
 
     fn spec(command: Vec<&str>, cwd: &std::path::Path) -> PaneSpec {
         PaneSpec {
-            name: "test".into(),
             command: command.into_iter().map(str::to_owned).collect(),
             env: BTreeMap::new(),
             cwd: cwd.to_path_buf(),
@@ -822,6 +849,59 @@ mod tests {
             "contents: {:?}",
             pane.contents()
         );
+        pane.kill();
+    }
+
+    #[test]
+    fn decodes_osc52_clipboard_writes() {
+        let mut parser = Parser::new_with_callbacks(
+            std::num::NonZeroU16::new(24).unwrap(),
+            std::num::NonZeroU16::new(80).unwrap(),
+            0,
+            PaneCallbacks::default(),
+        );
+        parser.process(b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(parser.callbacks_mut().take_clipboard(), vec!["hello"]);
+        parser.process(b"\x1b]52;c;aGVsbG8\x07");
+        assert_eq!(parser.callbacks_mut().take_clipboard(), vec!["hello"]);
+        parser.process(b"\x1b]52;c;not base64!\x07");
+        assert!(parser.callbacks_mut().take_clipboard().is_empty());
+    }
+
+    #[test]
+    fn forwards_osc52_writes_from_the_pty() {
+        let dir = cwd();
+        let pane = test_pane(vec!["sh"], dir.path());
+        assert!(
+            wait_for(
+                || !pane.contents().trim().is_empty(),
+                Duration::from_secs(5)
+            ),
+            "shell did not start"
+        );
+        // Subscribe before sending the command so the broadcast cannot race
+        // the parser callback.
+        let mut clipboard = pane.subscribe_clipboard();
+        pane.write_input(b"printf '\\033]52;c;aGVsbG8=\\a'\n")
+            .unwrap();
+        let mut received = None;
+        assert!(
+            wait_for(
+                || match clipboard.try_recv() {
+                    Ok(text) => {
+                        received = Some(text);
+                        true
+                    }
+                    Err(broadcast::error::TryRecvError::Empty) => false,
+                    Err(_) => true,
+                },
+                Duration::from_secs(5)
+            ),
+            "no OSC 52 clipboard write observed; status={:?} contents={:?}",
+            pane.status(),
+            pane.contents()
+        );
+        assert_eq!(received.as_deref(), Some("hello"));
         pane.kill();
     }
 

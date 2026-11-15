@@ -19,6 +19,7 @@ const CLIENT_INPUT: u8 = 1;
 /// Server -> client frame tags.
 const SERVER_FULL: u8 = 0;
 const SERVER_DIFF: u8 = 1;
+const SERVER_CLIPBOARD: u8 = 2;
 
 const TICK: Duration = Duration::from_millis(33);
 
@@ -38,6 +39,7 @@ pub async fn pane_socket(
 
 async fn run(socket: WebSocket, pane: std::sync::Arc<Pane>, client_id: u64) {
     let (mut sink, mut stream) = socket.split();
+    let mut clipboard = pane.subscribe_clipboard();
     let snapshot = pane.snapshot();
     if send_full(&mut sink, &snapshot).await.is_err() {
         return;
@@ -81,6 +83,19 @@ async fn run(socket: WebSocket, pane: std::sync::Arc<Pane>, client_id: u64) {
                     previous = update.screen;
                 }
             }
+            clip = clipboard.recv() => {
+                match clip {
+                    Ok(text) => {
+                        if send_clipboard(&mut sink, &text).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!(pane = pane.id().get(), skipped, "clipboard events lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                }
+            }
             message = stream.next() => {
                 match message {
                     Some(Ok(Message::Binary(data))) => {
@@ -122,6 +137,16 @@ fn handle_client_frame(pane: &Pane, client_id: u64, data: Bytes) {
         }
         _ => {}
     }
+}
+
+async fn send_clipboard(
+    sink: &mut SplitSink<WebSocket, Message>,
+    text: &str,
+) -> Result<(), axum::Error> {
+    let mut payload = Vec::with_capacity(1 + text.len());
+    payload.push(SERVER_CLIPBOARD);
+    payload.extend_from_slice(text.as_bytes());
+    sink.send(Message::Binary(Bytes::from(payload))).await
 }
 
 async fn send_full(
