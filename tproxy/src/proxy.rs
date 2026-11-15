@@ -20,7 +20,6 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 const MAX_ERROR_BODY_BYTES: usize = 1 << 20;
-const MAX_RATE_KEYS: usize = 100_000;
 const DASHBOARD: &str = include_str!("dashboard.html");
 
 #[derive(Clone)]
@@ -118,12 +117,16 @@ impl AppState {
     }
 
     fn authenticate(&self, headers: &HeaderMap) -> Option<&str> {
-        let token = bearer(headers)?;
-        let token = digest(token);
-        self.keys
-            .iter()
-            .find(|(_, key)| bool::from(key.as_slice().ct_eq(token.as_slice())))
-            .map(|(user, _)| user.as_str())
+        let token = digest(bearer(headers)?);
+        // Compare against every key so the time taken does not reveal which
+        // user, or where in the list, a matching key was found.
+        let mut matched = None;
+        for (user, key) in self.keys.iter() {
+            if bool::from(key.as_slice().ct_eq(token.as_slice())) {
+                matched = Some(user.as_str());
+            }
+        }
+        matched
     }
 }
 
@@ -181,9 +184,8 @@ impl RateLimiter {
             });
             state.last_cleanup = now;
         }
-        if state.buckets.len() >= MAX_RATE_KEYS && !state.buckets.contains_key(key) {
-            return Err(RateLimit { retry_after: 1 });
-        }
+        // Buckets are keyed by authenticated user name, so the map is bounded
+        // by the number of configured users and never grows without limit.
         let bucket = state.buckets.entry(key.into()).or_insert(Bucket {
             tokens: self.capacity,
             updated: now,
@@ -358,19 +360,53 @@ async fn forward(State(state): State<AppState>, request: Request) -> Result<Resp
         .map_err(|e| ApiError::internal(format!("build response: {e}")))
 }
 
+/// Path below the `/v1` prefix, or the whole path when the prefix is absent.
+fn v1_suffix(path: &str) -> &str {
+    path.strip_prefix("/v1").unwrap_or(path)
+}
+
 fn safe_upstream_path(path: &str) -> bool {
-    let suffix = path.strip_prefix("/v1").unwrap_or(path);
-    suffix.split('/').all(|segment| {
-        !segment.contains("..")
-            && segment != "."
-            && !segment.contains('\\')
-            && !segment.to_ascii_lowercase().contains("%2e")
+    v1_suffix(path).split('/').all(|segment| {
+        let segment = percent_decode(segment);
+        !segment.windows(2).any(|pair| pair == b"..")
+            && segment.as_slice() != b"."
+            && !segment.contains(&b'/')
+            && !segment.contains(&b'\\')
     })
 }
 
+/// Decode `%XX` escapes so percent-encoded dot segments cannot slip past the
+/// traversal check. Invalid escapes are kept as-is.
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let (Some(high), Some(low)) = (bytes.get(index + 1), bytes.get(index + 2))
+            && let (Some(high), Some(low)) = (hex_value(*high), hex_value(*low))
+        {
+            out.push(high << 4 | low);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    out
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn upstream_url(endpoint: &str, path: &str, query: Option<&str>) -> String {
-    let suffix = path.strip_prefix("/v1").unwrap_or(path);
-    let suffix = suffix.trim_start_matches('/');
+    let suffix = v1_suffix(path).trim_start_matches('/');
     let endpoint = endpoint.trim_end_matches('/');
     let mut url = if suffix.is_empty() {
         endpoint.to_string()
@@ -385,10 +421,14 @@ fn upstream_url(endpoint: &str, path: &str, query: Option<&str>) -> String {
 }
 
 fn request_headers(headers: &HeaderMap) -> HeaderMap {
-    const FORWARD: [&str; 3] = ["accept", "idempotency-key", "openai-beta"];
+    const FORWARD: [HeaderName; 3] = [
+        header::ACCEPT,
+        HeaderName::from_static("idempotency-key"),
+        HeaderName::from_static("openai-beta"),
+    ];
     headers
         .iter()
-        .filter(|(name, _)| FORWARD.contains(&name.as_str()))
+        .filter(|(name, _)| FORWARD.contains(name))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
@@ -586,9 +626,25 @@ mod tests {
     fn rejects_unsafe_paths() {
         assert!(safe_upstream_path("/v1/chat/completions"));
         assert!(safe_upstream_path("/v1/models/a"));
+        assert!(safe_upstream_path("/v1/a%20b"));
+        assert!(!safe_upstream_path("/v1/a..b"));
         assert!(!safe_upstream_path("/v1/../admin"));
+        assert!(!safe_upstream_path("/v1/./admin"));
         assert!(!safe_upstream_path("/v1/%2e%2e/admin"));
+        assert!(!safe_upstream_path("/v1/%2E%2E/admin"));
+        assert!(!safe_upstream_path("/v1/..%2fadmin"));
+        assert!(!safe_upstream_path("/v1/a%2Fb"));
+        assert!(!safe_upstream_path("/v1/a%5cb"));
         assert!(!safe_upstream_path("/v1/a\\b"));
+        assert!(!safe_upstream_path("/v1/%2e"));
+    }
+
+    #[test]
+    fn decodes_percent_escapes() {
+        assert_eq!(percent_decode("a%20b"), b"a b");
+        assert_eq!(percent_decode("%2e%2E"), b"..");
+        assert_eq!(percent_decode("%zz%2"), b"%zz%2");
+        assert_eq!(percent_decode("plain"), b"plain");
     }
 
     #[test]

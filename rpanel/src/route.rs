@@ -42,11 +42,21 @@ impl Route {
         self.wildcard
     }
 
+    /// The raw incoming prefix. For a wildcard route this includes the trailing
+    /// slash (`/api/*` -> `/api/`); for an exact route it is the pattern itself.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// The `X-Forwarded-Prefix` value for this route: the incoming path prefix the
-    /// client sees, or `None` when the group did not opt in or the route is at the
-    /// root (an empty prefix).
+    /// client sees, without a trailing slash. `None` when the group did not opt in
+    /// or the route is at the root (an empty prefix).
     pub fn forwarded_prefix(&self) -> Option<&str> {
-        (self.forwarded_prefix && self.prefix != "/").then_some(self.prefix.as_str())
+        if !self.forwarded_prefix {
+            return None;
+        }
+        let prefix = self.prefix.trim_end_matches('/');
+        (!prefix.is_empty()).then_some(prefix)
     }
 
     /// Returns the wildcard capture for `path`, or `Some("")` for an exact match.
@@ -159,6 +169,21 @@ mod tests {
             route.upstream_uri("/a/b", None).unwrap().to_string(),
             "https://cow.local:3001/tary/a/b"
         );
+    }
+
+    #[test]
+    fn forwarded_prefix_has_no_trailing_slash() {
+        let mut group = group("127.0.0.1:8080", false, &[]);
+        group.forwarded_prefix = true;
+
+        let wildcard = Route::new("g", &group, "/app/*", "/*");
+        assert_eq!(wildcard.forwarded_prefix(), Some("/app"));
+
+        let exact = Route::new("g", &group, "/app", "/");
+        assert_eq!(exact.forwarded_prefix(), Some("/app"));
+
+        let root = Route::new("g", &group, "/*", "/*");
+        assert_eq!(root.forwarded_prefix(), None);
     }
 
     #[test]

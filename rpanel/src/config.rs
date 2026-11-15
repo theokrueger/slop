@@ -169,12 +169,24 @@ impl Config {
         if self.server.host.chars().any(char::is_whitespace) {
             bail!("server.host must not contain whitespace");
         }
+        if self.server.host.contains("://") || self.server.host.contains('/') {
+            bail!("server.host must be a hostname or IP address, not a URL");
+        }
         if self.server.port == 0 {
             bail!("server.port must not be zero");
         }
         if !self.server.allow_insecure && (self.server.cert.is_none() || self.server.key.is_none())
         {
             bail!("server.cert and server.key are required unless server.allow_insecure is true");
+        }
+        if self
+            .panel
+            .status
+            .status
+            .iter()
+            .any(|service| service.name().trim().is_empty())
+        {
+            bail!("panel.status.status entries must have a non-empty name");
         }
 
         let mut seen = HashSet::new();
@@ -210,7 +222,11 @@ fn validate_host(group: &str, host: &str) -> Result<()> {
     if host.contains('/') || host.contains('@') || host.chars().any(char::is_whitespace) {
         bail!("group {group:?}: invalid host {host:?}");
     }
-    Authority::from_str(host).with_context(|| format!("group {group:?}: invalid host {host:?}"))?;
+    let authority = Authority::from_str(host)
+        .with_context(|| format!("group {group:?}: invalid host {host:?}"))?;
+    if authority.port_u16() == Some(0) {
+        bail!("group {group:?}: host {host:?} must not use port 0");
+    }
     Ok(())
 }
 
@@ -375,6 +391,43 @@ groups:
 "#;
         let err = Config::parse(yaml).unwrap_err().to_string();
         assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn rejects_empty_service_names() {
+        let yaml = r#"
+server: { allow_insecure: true }
+panel:
+  status:
+    status:
+      - "  "
+groups: {}
+"#;
+        let err = Config::parse(yaml).unwrap_err().to_string();
+        assert!(err.contains("non-empty"), "{err}");
+    }
+
+    #[test]
+    fn rejects_port_zero_upstream() {
+        let yaml = r#"
+server: { allow_insecure: true }
+groups:
+  a:
+    host: "localhost:0"
+    paths: { "/x": /x }
+"#;
+        let err = Config::parse(yaml).unwrap_err().to_string();
+        assert!(err.contains("port 0"), "{err}");
+    }
+
+    #[test]
+    fn rejects_url_as_server_host() {
+        let yaml = r#"
+server: { allow_insecure: true, host: "http://127.0.0.1" }
+groups: {}
+"#;
+        let err = Config::parse(yaml).unwrap_err().to_string();
+        assert!(err.contains("not a URL"), "{err}");
     }
 
     #[test]

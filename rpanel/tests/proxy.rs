@@ -28,7 +28,7 @@ async fn upstream() -> String {
                 .to_owned()
         };
         let text = format!(
-            "{} {} host={} x-test={} proto={} xff={} real={} xfh={} body={}",
+            "{} {} host={} x-test={} proto={} xff={} real={} xfh={} xfp={} origin={} referer={} body={}",
             parts.method,
             parts.uri,
             get(&parts.headers, "host"),
@@ -37,6 +37,9 @@ async fn upstream() -> String {
             get(&parts.headers, "x-forwarded-for"),
             get(&parts.headers, "x-real-ip"),
             get(&parts.headers, "x-forwarded-host"),
+            get(&parts.headers, "x-forwarded-prefix"),
+            get(&parts.headers, "origin"),
+            get(&parts.headers, "referer"),
             String::from_utf8_lossy(&body)
         );
         (
@@ -66,6 +69,14 @@ fn state(config: Config) -> Arc<AppState> {
 
 fn app(state: Arc<AppState>) -> Router {
     Router::new().fallback(proxy::handler).with_state(state)
+}
+
+#[test]
+fn example_config_parses() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/rpanel.example.yaml");
+    let text = std::fs::read_to_string(path).unwrap();
+    let config = Config::parse(&text).unwrap();
+    assert_eq!(config.groups.len(), 3);
 }
 
 #[tokio::test]
@@ -107,6 +118,113 @@ groups:
     assert!(text.contains("real=192.0.2.1"), "{text}");
     assert!(text.contains("xfh=example.test"), "{text}");
     assert!(text.contains("body=hi"), "{text}");
+}
+
+#[tokio::test]
+async fn sets_forwarded_prefix_without_trailing_slash() {
+    let host = upstream().await;
+    let config = Config::parse(&format!(
+        r#"
+server: {{ allow_insecure: true }}
+groups:
+  app:
+    host: "{host}"
+    forwarded_prefix: true
+    paths:
+      "/app/*": "/*"
+"#
+    ))
+    .unwrap();
+
+    let request = Request::builder()
+        .uri("/app/x")
+        .header("host", "example.test")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(state(config)).oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("GET /x"), "{text}");
+    assert!(text.contains("xfp=/app"), "{text}");
+}
+
+#[tokio::test]
+async fn keeps_cross_origin_headers_but_rewrites_same_origin() {
+    let host = upstream().await;
+    let config = Config::parse(&format!(
+        r#"
+server: {{ allow_insecure: true }}
+groups:
+  api:
+    host: "{host}"
+    paths:
+      "/api/*": "/v1/*"
+"#
+    ))
+    .unwrap();
+
+    let request_with = |origin: &str| {
+        Request::builder()
+            .uri("/api/page")
+            .header("host", "example.test")
+            .header("origin", origin)
+            .header("referer", format!("{origin}/api/page"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let same = app(state(config.clone()))
+        .oneshot(request_with("http://example.test"))
+        .await
+        .unwrap();
+    let body = to_bytes(same.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains(&format!("origin=http://{host}")), "{text}");
+    assert!(
+        text.contains(&format!("referer=http://{host}/api/page")),
+        "{text}"
+    );
+
+    let cross = app(state(config))
+        .oneshot(request_with("http://evil.test"))
+        .await
+        .unwrap();
+    let body = to_bytes(cross.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("origin=http://evil.test"), "{text}");
+    assert!(text.contains("referer=http://evil.test/api/page"), "{text}");
+}
+
+#[tokio::test]
+async fn exact_route_wins_over_catch_all_without_redirect() {
+    let host = upstream().await;
+    let config = Config::parse(&format!(
+        r#"
+server: {{ allow_insecure: true }}
+groups:
+  root:
+    host: "{host}"
+    paths:
+      "/*": "/root/*"
+  health:
+    host: "{host}"
+    paths:
+      "/health": "/health"
+"#
+    ))
+    .unwrap();
+
+    let request = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(state(config)).oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("GET /health"));
 }
 
 #[tokio::test]
@@ -167,6 +285,7 @@ groups: {}
         response.headers()[header::X_CONTENT_TYPE_OPTIONS],
         "nosniff"
     );
+    assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
     assert!(
         response.headers()[header::CONTENT_SECURITY_POLICY]
             .to_str()

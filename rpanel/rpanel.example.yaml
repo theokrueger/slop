@@ -29,18 +29,26 @@ panel:
       # - name: my-user-service
       #   user: true
   links:
-    Tary: "/tary"
-    Name: "/name"
+    Tary: "/tary/"
+    Name: "/name/"
 
 groups:
   "Name":
     host: "127.0.0.1:8080"
     https: false
     paths:
-      "/": "/name"
-      "/api/*": "/nameapi/v1/*"
+      "/name": "/"
+      "/name/*": "/*"
   "Tary":
     host: "cow.local:3001"
     https: false
+    # Send X-Forwarded-Prefix for apps served under a path prefix.
+    forwarded_prefix: true
     paths:
-      "/*": "/tary/*"
+      "/tary": "/"
+      "/tary/*": "/*"
+  "API":
+    host: "127.0.0.1:8081"
+    https: false
+    paths:
+      "/api/*": "/v1/*"

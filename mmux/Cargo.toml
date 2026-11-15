@@ -1,0 +1,40 @@
+[package]
+name = "mmux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A persistent, tmux-like terminal multiplexer for agents, served over the web"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+directories = "6.0"
+futures-util = "0.3"
+mime_guess = "2.0"
+nix = { version = "0.32", features = ["process", "signal", "user"] }
+nonstick = "0.1"
+parking_lot = "0.12.5"
+portable-pty = "0.9"
+rust-embed = "8.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+shellexpand = "3.1"
+thiserror = "2.0"
+time = "0.3"
+tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "1.0"
+tower-http = { version = "0.6", features = ["set-header", "trace"] }
+tower-sessions = { version = "0.15", features = ["memory-store"] }
+tower_governor = { version = "0.8", default-features = false, features = ["axum"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+vt100 = "0.18"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3.20"
+tokio-tungstenite = "0.28"
+tower = { version = "0.5", features = ["util"] }

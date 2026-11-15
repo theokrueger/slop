@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use rpanel::{
     config::{Config, ServerConfig},
-    net::{NetworkHistory, spawn_sampler},
+    net::{NetworkHistory, RETENTION, spawn_sampler},
     panel, proxy,
     route::build_routes,
     state::{AppState, PanelState, build_client},
@@ -38,13 +38,43 @@ async fn main() -> Result<()> {
     }
 
     let _log_guard = init_logging(&config.server)?;
+    // axum-server is built without a default crypto provider; install ring
+    // before loading any TLS configuration. An existing provider is fine.
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
 
+    let addr = resolve_addr(&config.server).await?;
+    let insecure = config.server.allow_insecure;
+    let tls = if insecure {
+        None
+    } else {
+        let cert = config
+            .server
+            .cert
+            .as_ref()
+            .context("server.cert is required")?;
+        let key = config
+            .server
+            .key
+            .as_ref()
+            .context("server.key is required")?;
+        Some(
+            RustlsConfig::from_pem_file(cert, key)
+                .await
+                .with_context(|| {
+                    format!(
+                        "loading TLS certificate {} and key {}",
+                        cert.display(),
+                        key.display()
+                    )
+                })?,
+        )
+    };
+
     let routes = Arc::new(build_routes(&config.groups));
     let client = build_client(config.server.allow_insecure_upstream)?;
-    let network = Arc::new(NetworkHistory::new(Duration::from_secs(32 * 24 * 60 * 60)));
+    let network = Arc::new(NetworkHistory::new(RETENTION));
 
     if config.panel.enable && config.panel.status.network {
         spawn_sampler(network.clone(), Duration::from_secs(10));
@@ -57,8 +87,15 @@ async fn main() -> Result<()> {
         })
     });
 
+    tracing::info!(
+        %addr,
+        tls = !insecure,
+        groups = config.groups.len(),
+        "starting rpanel"
+    );
+
     let state = Arc::new(AppState {
-        config: Arc::new(config.clone()),
+        config: Arc::new(config),
         routes,
         client,
         panel: panel_state,
@@ -70,43 +107,16 @@ async fn main() -> Result<()> {
     }
     let app = app.fallback(proxy::handler).with_state(state);
 
-    let addr = resolve_addr(&config.server).await?;
-    tracing::info!(
-        %addr,
-        tls = !config.server.allow_insecure,
-        groups = config.groups.len(),
-        "starting rpanel"
-    );
-
     let handle = axum_server::Handle::<SocketAddr>::new();
     spawn_shutdown(handle.clone());
 
-    if config.server.allow_insecure {
-        axum_server::bind(addr)
+    if let Some(tls) = tls {
+        axum_server::tls_rustls::bind_rustls(addr, tls)
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
-        let cert = config
-            .server
-            .cert
-            .as_ref()
-            .context("server.cert is required")?;
-        let key = config
-            .server
-            .key
-            .as_ref()
-            .context("server.key is required")?;
-        let tls = RustlsConfig::from_pem_file(cert, key)
-            .await
-            .with_context(|| {
-                format!(
-                    "loading TLS certificate {} and key {}",
-                    cert.display(),
-                    key.display()
-                )
-            })?;
-        axum_server::tls_rustls::bind_rustls(addr, tls)
+        axum_server::bind(addr)
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;

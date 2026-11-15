@@ -1,3 +1,4 @@
+use crate::fs_util::write_atomic;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,7 +10,7 @@ use std::{
 };
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: Server,
     pub models: BTreeMap<String, Model>,
@@ -17,10 +18,12 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Server {
     pub host: String,
-    pub port: String,
+    #[serde(default = "default_port", deserialize_with = "deserialize_port")]
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<PathBuf>,
     pub rate_limit: u32,
     pub max_concurrency: usize,
@@ -31,7 +34,7 @@ impl Default for Server {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".into(),
-            port: "8001".into(),
+            port: default_port(),
             log: None,
             rate_limit: 100,
             max_concurrency: 128,
@@ -40,7 +43,30 @@ impl Default for Server {
     }
 }
 
+fn default_port() -> u16 {
+    8001
+}
+
+/// Accept both `port: 8001` and the older quoted form `port: "8001"`.
+fn deserialize_port<'de, D>(deserializer: D) -> std::result::Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Port {
+        Number(u16),
+        Text(String),
+    }
+
+    match Port::deserialize(deserializer)? {
+        Port::Number(port) => Ok(port),
+        Port::Text(text) => text.trim().parse().map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Model {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,7 +94,7 @@ pub struct Model {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Cost {
     pub input: f64,
     pub output: f64,
@@ -149,6 +175,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.server.host.trim().is_empty() {
+            bail!("server.host cannot be empty");
+        }
+        if self.server.host.chars().any(char::is_whitespace) {
+            bail!("server.host must not contain whitespace");
+        }
+        if self.server.port == 0 {
+            bail!("server.port must be between 1 and 65535");
+        }
         if self.server.max_concurrency == 0 {
             bail!("server.max_concurrency must be greater than zero");
         }
@@ -163,6 +198,9 @@ impl Config {
             }
             if !url.username().is_empty() || url.password().is_some() {
                 bail!("model {alias:?} endpoint must not contain credentials; use api_key");
+            }
+            if url.query().is_some() || url.fragment().is_some() {
+                bail!("model {alias:?} endpoint must not contain a query string or fragment");
             }
             if url.scheme() == "http"
                 && !self.server.allow_insecure_upstream
@@ -213,6 +251,7 @@ impl Config {
                 bail!("model {alias:?} cost values must be finite and non-negative");
             }
         }
+        let mut owners = BTreeMap::new();
         for (name, key) in &self.users {
             if name.trim().is_empty() {
                 bail!("user name cannot be empty");
@@ -223,20 +262,17 @@ impl Config {
             if key.chars().any(char::is_whitespace) {
                 bail!("user {name:?} API key must not contain whitespace");
             }
+            if let Some(other) = owners.insert(key, name) {
+                bail!("users {other:?} and {name:?} share the same API key");
+            }
         }
         Ok(())
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
         let text = serde_yaml_ng::to_string(self).context("serialize config")?;
-        fs::write(path, text).with_context(|| format!("write config {}", path.display()))?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("set permissions on {}", path.display()))?;
-        Ok(())
+        write_atomic(path, text.as_bytes())
     }
 }
 
@@ -302,7 +338,7 @@ users:
         )
         .unwrap();
 
-        assert_eq!(config.server.port, "8001");
+        assert_eq!(config.server.port, 8001);
         assert_eq!(
             config.models["morph-dsv41flash-1017"].endpoint,
             "https://api.morphllm.com/v1"
@@ -336,7 +372,7 @@ users:
     fn defaults_are_optional() {
         let config: Config = serde_yaml_ng::from_str("models: {}\n").unwrap();
         assert_eq!(config.server.host, "127.0.0.1");
-        assert_eq!(config.server.port, "8001");
+        assert_eq!(config.server.port, 8001);
         assert_eq!(config.server.rate_limit, 100);
         assert_eq!(config.server.max_concurrency, 128);
         assert!(!config.server.allow_insecure_upstream);
@@ -348,6 +384,70 @@ users:
         let mut config = Config::default();
         config.server.max_concurrency = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        assert!(serde_yaml_ng::from_str::<Config>("rate_limt: 5\n").is_err());
+        assert!(serde_yaml_ng::from_str::<Config>("server:\n  max_concurrencyy: 5\n").is_err());
+        assert!(
+            serde_yaml_ng::from_str::<Config>(
+                "models:\n  alias:\n    endpoint: https://example.com/v1\n    typo: 1\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_integer_and_quoted_ports() {
+        let config: Config = serde_yaml_ng::from_str("server:\n  port: 9000\n").unwrap();
+        assert_eq!(config.server.port, 9000);
+        let config: Config = serde_yaml_ng::from_str("server:\n  port: \"9000\"\n").unwrap();
+        assert_eq!(config.server.port, 9000);
+        assert!(serde_yaml_ng::from_str::<Config>("server:\n  port: nope\n").is_err());
+    }
+
+    #[test]
+    fn rejects_bad_bind_address() {
+        let mut config = Config::default();
+        config.server.host = "  ".into();
+        assert!(config.validate().is_err());
+        config.server.host = "127.0.0.1 ".into();
+        assert!(config.validate().is_err());
+        config.server.host = "127.0.0.1".into();
+        config.server.port = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_endpoint_query_and_fragment() {
+        let mut config = Config::default();
+        config.models.insert(
+            "alias".into(),
+            Model {
+                endpoint: "https://example.com/v1?key=1".into(),
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_err());
+        config.models.insert(
+            "alias".into(),
+            Model {
+                endpoint: "https://example.com/v1#frag".into(),
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_user_keys() {
+        let mut config = Config::default();
+        config.users.insert("alice".into(), "sk-same".into());
+        config.users.insert("bob".into(), "sk-same".into());
+        assert!(config.validate().is_err());
+        config.users.insert("bob".into(), "sk-other".into());
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -498,7 +598,20 @@ users: {}
             },
         );
         config.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("port: 8001"), "{text}");
+        assert!(!text.contains("log: null"), "{text}");
         assert_eq!(Config::load(&path).unwrap().users["me"], "sk-test");
+    }
+
+    #[test]
+    fn accepts_camel_case_cost_aliases() {
+        let config: Config = serde_yaml_ng::from_str(
+            "models:\n  alias:\n    endpoint: https://example.com/v1\n    cost:\n      cacheRead: 1.5\n      cacheWrite: 2.5\n",
+        )
+        .unwrap();
+        assert_eq!(config.models["alias"].cost.cache_read, 1.5);
+        assert_eq!(config.models["alias"].cost.cache_write, 2.5);
     }
 
     #[test]

@@ -1,0 +1,22 @@
+[Unit]
+Description=mmux web terminal multiplexer
+After=network-online.target
+
+[Service]
+Type=simple
+# Start through a login shell so the user's PATH and profile environment are
+# available to pane commands (pi, emacs, agents, ...). Replace the path if you
+# installed mmux elsewhere.
+ExecStart=/bin/bash -lc "exec %h/.local/bin/mmux"
+Environment=RUST_LOG=mmux=info
+# Pane commands inherit this PATH. It covers the default `pi` panes and the
+# node runtime installed by the Pi installer, in addition to standard paths.
+Environment=PATH=%h/.pi/agent/bin:%h/.local/share/pi-node/current/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Restart=on-failure
+RestartSec=2
+# Stopping the service terminates every pane, like stopping a tmux server.
+KillMode=control-group
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

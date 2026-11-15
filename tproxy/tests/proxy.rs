@@ -44,6 +44,20 @@ async fn leaky(headers: HeaderMap) -> Response {
     response
 }
 
+async fn redirect() -> Response {
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, "http://example.com/")],
+    )
+        .into_response()
+}
+
+async fn slow(State(capture): State<Capture>, headers: HeaderMap, body: Bytes) -> Response {
+    let payload = serde_json::from_slice(&body).unwrap();
+    capture.0.send((headers, payload)).unwrap();
+    std::future::pending::<Response>().await
+}
+
 async fn spawn(app: Router) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -63,6 +77,8 @@ async fn setup_with(
         .route("/v1/chat/completions", post(capture))
         .route("/v1/echo", post(capture))
         .route("/v1/error", post(leaky))
+        .route("/v1/redirect", post(redirect))
+        .route("/v1/slow", post(slow))
         .with_state(Capture(tx));
     let upstream_addr = spawn(upstream).await;
 
@@ -268,6 +284,54 @@ async fn records_usage_and_serves_dashboard() {
             .starts_with("text/html")
     );
     assert!(dashboard.text().await.unwrap().contains("tproxy usage"));
+}
+
+#[tokio::test]
+async fn refuses_upstream_redirects() {
+    let (proxy_addr, _captured) = setup().await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/redirect"))
+        .bearer_auth("sk-test")
+        .json(&json!({"model": "alias"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 502);
+    assert!(response.headers().get(header::LOCATION).is_none());
+}
+
+#[tokio::test]
+async fn rejects_requests_over_the_concurrency_limit() {
+    let (proxy_addr, mut captured) = setup_with(|config| config.server.max_concurrency = 1).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{proxy_addr}/v1/slow");
+
+    let slow = tokio::spawn({
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .post(url)
+                .bearer_auth("sk-test")
+                .json(&json!({"model": "alias"}))
+                .send()
+                .await
+        }
+    });
+
+    // The first request is upstream and holding the only permit.
+    captured.recv().await.unwrap();
+    let busy = client
+        .post(&url)
+        .bearer_auth("sk-test")
+        .json(&json!({"model": "alias"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(busy.status(), 503);
+    assert!(busy.headers().contains_key(header::RETRY_AFTER));
+    slow.abort();
 }
 
 #[tokio::test]

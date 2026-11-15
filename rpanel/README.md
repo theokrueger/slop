@@ -68,8 +68,15 @@ excluded.
 
 ### `groups`
 
-Each group has an upstream `host`, an `https` flag, and a map of incoming path
-patterns to upstream path patterns.
+Each group has an upstream `host`, an `https` flag, a `forwarded_prefix` flag,
+and a map of incoming path patterns to upstream path patterns.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `host` | — | Upstream authority, e.g. `127.0.0.1:8080` or `cow.local:3001`. |
+| `https` | `false` | Connect to the upstream over TLS. |
+| `paths` | `{}` | Incoming path pattern -> upstream path pattern. |
+| `forwarded_prefix` | `false` | Send `X-Forwarded-Prefix` with the matched incoming path prefix (no trailing slash). |
 
 ```yaml
 groups:
@@ -77,13 +84,20 @@ groups:
     host: "127.0.0.1:8080"
     https: false
     paths:
-      "/": "/name"
-      "/api/*": "/nameapi/v1/*"
+      "/name": "/"
+      "/name/*": "/*"
   "Tary":
     host: "cow.local:3001"
     https: false
+    forwarded_prefix: true
     paths:
-      "/*": "/tary/*"
+      "/tary": "/"
+      "/tary/*": "/*"
+  "API":
+    host: "127.0.0.1:8081"
+    https: false
+    paths:
+      "/api/*": "/v1/*"
 ```
 
 Path matching:
@@ -92,19 +106,30 @@ Path matching:
 - A trailing `/*` matches that prefix and captures the remainder.
   `/api/*` matches `/api/request` with capture `request`.
 - The wildcard is substituted into the upstream pattern:
-  `/api/request` -> `/nameapi/v1/request`.
+  `/api/request` -> `/v1/request`, and `/name/request` -> `/request`.
 - Exact routes win over wildcards; longer wildcard prefixes win over shorter
   ones.
+- If both `/x` and `/x/*` are configured, a request for `/x` is redirected
+  (308) to `/x/` so relative URLs resolve under the wildcard route.
 - Query strings are preserved.
 - Unmatched paths return `404`.
 
 The proxy forwards the method, body, and end-to-end headers, drops hop-by-hop
-headers, rewrites `Host`, and adds `X-Forwarded-For`, `X-Forwarded-Host`,
-`X-Forwarded-Proto`, and `X-Real-IP`.
+headers, rewrites `Host`, and adds `X-Forwarded-For` (appended to any
+client-supplied value), `X-Forwarded-Host`, `X-Forwarded-Proto`, and
+`X-Real-IP`. Groups with `forwarded_prefix` also get `X-Forwarded-Prefix`.
 
 ## Notes
 
 - HTTPS upstreams use the platform's native root certificates.
+- For same-origin requests, `Origin` and `Referer` are rewritten to the
+  upstream origin so upstream CSRF checks keep working. Cross-origin values
+  are forwarded unchanged, so the upstream still rejects them.
+- `X-Forwarded-For` appends the client address to any value the client sent. If
+  rpanel is directly exposed to untrusted clients and an upstream trusts that
+  header for authorization, strip or ignore it upstream.
+- The panel is served with `Content-Security-Policy`, `X-Content-Type-Options`,
+  and `Referrer-Policy` headers and is never cached.
 - Storage reporting omits virtual filesystems such as `proc`, `sysfs`, and
   `tmpfs`.
 - The panel is only registered when `panel.enable` is true. If it is disabled,

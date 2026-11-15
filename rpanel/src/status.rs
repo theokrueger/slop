@@ -63,7 +63,7 @@ pub async fn collect(config: &StatusConfig) -> SystemStatus {
     }
 
     if !config.status.is_empty() {
-        status.services = join_all(config.status.iter().cloned().map(service_status)).await;
+        status.services = join_all(config.status.iter().map(service_status)).await;
     }
 
     status
@@ -117,7 +117,7 @@ fn is_virtual(fs: &str) -> bool {
     )
 }
 
-async fn service_status(service: Service) -> ServiceStatus {
+async fn service_status(service: &Service) -> ServiceStatus {
     let name = service.name().to_owned();
     let user = service.user();
     let mut status = ServiceStatus {
@@ -142,9 +142,9 @@ async fn service_status(service: Service) -> ServiceStatus {
             "SubState",
             "-p",
             "Description",
-            "--value",
-            &status.name,
+            "--",
         ])
+        .arg(&status.name)
         .kill_on_drop(true);
 
     match tokio::time::timeout(Duration::from_secs(2), command.output()).await {
@@ -171,14 +171,30 @@ async fn service_status(service: Service) -> ServiceStatus {
 }
 
 fn parse_show(stdout: &str) -> (String, String, String) {
-    let mut lines = stdout.lines();
-    let state = lines.next().unwrap_or_default().trim();
-    let sub_state = lines.next().unwrap_or_default().trim();
-    let description = lines.next().unwrap_or_default().trim();
+    let mut state = None;
+    let mut sub_state = None;
+    let mut description = None;
+
+    for line in stdout.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().to_owned();
+        match key.trim() {
+            "ActiveState" => state = Some(value),
+            "SubState" => sub_state = Some(value),
+            "Description" => description = Some(value),
+            _ => {}
+        }
+    }
+
+    let state = state
+        .filter(|state| !state.is_empty())
+        .unwrap_or_else(|| "unknown".into());
     (
-        if state.is_empty() { "unknown" } else { state }.to_owned(),
-        sub_state.to_owned(),
-        description.to_owned(),
+        state,
+        sub_state.unwrap_or_default(),
+        description.unwrap_or_default(),
     )
 }
 
@@ -188,10 +204,21 @@ mod tests {
 
     #[test]
     fn parses_systemctl_show_output() {
-        let (state, sub, description) = parse_show("active\nrunning\nMy service\n");
+        // systemctl does not guarantee property ordering, so parse by key.
+        let (state, sub, description) =
+            parse_show("Description=My service\nActiveState=active\nSubState=running\n");
         assert_eq!(state, "active");
         assert_eq!(sub, "running");
         assert_eq!(description, "My service");
+    }
+
+    #[test]
+    fn parses_systemctl_output_in_any_order() {
+        let (state, sub, description) =
+            parse_show("SubState=running\nActiveState=active\nDescription=My = service\n");
+        assert_eq!(state, "active");
+        assert_eq!(sub, "running");
+        assert_eq!(description, "My = service");
     }
 
     #[test]

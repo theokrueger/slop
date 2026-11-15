@@ -7,11 +7,15 @@ use sysinfo::Networks;
 
 const MONTH: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// Samples kept in memory: one month plus a baseline sample so the month
+/// window can still be computed between polls.
+pub const RETENTION: Duration = Duration::from_secs(32 * 24 * 60 * 60);
+
 #[derive(Debug, Clone, Copy)]
-pub struct Sample {
-    pub at: Instant,
-    pub rx: u64,
-    pub tx: u64,
+struct Sample {
+    at: Instant,
+    rx: u64,
+    tx: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]

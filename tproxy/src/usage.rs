@@ -1,3 +1,4 @@
+use crate::fs_util::{create_parent, write_atomic};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -317,13 +318,6 @@ fn journal_path(path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn create_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    Ok(())
-}
-
 fn append_journal(path: &Path, data: &[u8]) -> Result<()> {
     create_parent(path)?;
     let before = fs::metadata(path)
@@ -352,16 +346,21 @@ fn append_journal(path: &Path, data: &[u8]) -> Result<()> {
         let _ = file.set_len(before);
         return Err(error).with_context(|| format!("append {}", path.display()));
     }
+    file.sync_data()
+        .with_context(|| format!("sync {}", path.display()))?;
     Ok(())
 }
 
 fn ends_with_newline(path: &Path, len: u64) -> bool {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
-        Err(_) => return true,
+        // When the last byte cannot be inspected, add a separator anyway: an
+        // extra blank line is ignored on load, while a missing one would glue
+        // the next entry onto a partial line and lose it.
+        Err(_) => return false,
     };
     if file.seek(SeekFrom::Start(len - 1)).is_err() {
-        return true;
+        return false;
     }
     let mut byte = [0u8; 1];
     file.read_exact(&mut byte).is_ok() && byte[0] == b'\n'
@@ -378,25 +377,6 @@ fn truncate_journal(path: &Path) -> Result<()> {
         .with_context(|| format!("open {}", path.display()))?;
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .with_context(|| format!("set permissions on {}", path.display()))?;
-    Ok(())
-}
-
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    create_parent(path)?;
-    let tmp = path.with_extension("json.tmp");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("open {}", tmp.display()))?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("set permissions on {}", tmp.display()))?;
-    file.write_all(data)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
@@ -584,6 +564,47 @@ mod tests {
         fs::write(&path, b"not json").unwrap();
         let usage = Usage::load(path);
         assert!(usage.snapshot_now().buckets.is_empty());
+    }
+
+    #[test]
+    fn recovers_partial_journal_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let journal = journal_path(&path);
+        let now = now_secs();
+        let usage = Usage::load(path.clone());
+        usage.record_at("alice", "m1", now);
+        usage.save().unwrap();
+
+        // Simulate a crash in the middle of an append.
+        let partial = format!("{{\"start\":{},\"counts\":{{\"alice\":", now);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(partial.as_bytes())
+            .unwrap();
+
+        usage.record_at("bob", "m2", now);
+        usage.save_if_dirty().unwrap();
+
+        // The new entry must start on its own line and survive replay.
+        let loaded = Usage::load(path);
+        let snapshot = loaded.snapshot_at(now);
+        assert_eq!(snapshot.buckets.len(), 1);
+        assert_eq!(snapshot.buckets[0].counts["alice"]["m1"], 1);
+        assert_eq!(snapshot.buckets[0].counts["bob"]["m2"], 1);
+    }
+
+    #[test]
+    fn save_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let usage = Usage::load(path.clone());
+        usage.record_at("a", "m", now_secs());
+        usage.save().unwrap();
+        assert!(path.exists());
+        assert!(!path.with_file_name("usage.json.tmp").exists());
     }
 
     #[test]

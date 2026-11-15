@@ -27,6 +27,10 @@ pub async fn handler(State(state): State<Arc<AppState>>) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
             "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
@@ -35,7 +39,7 @@ pub async fn handler(State(state): State<Arc<AppState>>) -> Response {
     response
 }
 
-pub fn render(config: &PanelConfig, status: &SystemStatus, stats: &Snapshot) -> String {
+fn render(config: &PanelConfig, status: &SystemStatus, stats: &Snapshot) -> String {
     let show_status = has_status(&config.status);
     let refresh = if config.refresh_seconds > 0 && show_status {
         format!(
@@ -242,7 +246,7 @@ fn render_services(html: &mut String, services: &[ServiceStatus]) {
     html.push_str("</ul></section>");
 }
 
-pub fn escape(input: &str) -> String {
+fn escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
         match c {
@@ -257,7 +261,7 @@ pub fn escape(input: &str) -> String {
     out
 }
 
-pub fn format_bytes(bytes: u64) -> String {
+fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -274,14 +278,14 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-pub fn format_rate(bytes_per_second: f64) -> String {
+fn format_rate(bytes_per_second: f64) -> String {
     format!(
         "{}/s",
         format_bytes(bytes_per_second.max(0.0).round() as u64)
     )
 }
 
-pub fn format_duration(seconds: u64) -> String {
+fn format_duration(seconds: u64) -> String {
     let days = seconds / 86_400;
     let hours = (seconds % 86_400) / 3_600;
     let minutes = (seconds % 3_600) / 60;

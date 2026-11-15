@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 use tokio::net::lookup_host;
@@ -79,11 +79,7 @@ async fn serve(path: &Path) -> Result<()> {
         }
     }
 
-    let port: u16 = config
-        .server
-        .port
-        .parse()
-        .with_context(|| format!("invalid server.port {:?}", config.server.port))?;
+    let port = config.server.port;
     let host = config.server.host.clone();
     let models = config.models.len();
     let users = config.users.len();
@@ -165,6 +161,7 @@ fn init_logging(path: Option<&Path>) -> Result<Option<WorkerGuard>> {
             let file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
+                .mode(0o600)
                 .open(path)
                 .with_context(|| format!("open log {}", path.display()))?;
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))

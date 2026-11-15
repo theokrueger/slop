@@ -1,0 +1,55 @@
+# mmux configuration
+#
+# Default location: $XDG_CONFIG_HOME/mmux/config.toml
+# Every setting below shows its built-in default.
+
+[server]
+# Keep this on loopback. Put a TLS reverse proxy (or an SSH tunnel) in front
+# of mmux for remote access, since credentials are sent to this endpoint.
+bind = "127.0.0.1:8787"
+# Mark the session cookie `Secure`. Set to true when serving over HTTPS.
+secure_cookies = false
+
+[auth]
+# Linux-PAM service used to verify the password of the user mmux runs as.
+# Create /etc/pam.d/mmux if you want a dedicated policy; otherwise the
+# standard `login` stack works. The mmux process must be allowed to invoke
+# pam_unix (it uses the setuid unix_chkpwd helper when running unprivileged).
+pam_service = "login"
+# Sessions expire after this many hours of inactivity.
+session_hours = 24
+
+[workspace]
+# The interactive directory picker cannot navigate outside this directory.
+# `~` expands to the home directory. Use "/" for unrestricted browsing.
+root = "~"
+
+[terminal]
+# Initial pane size, until a browser viewport negotiates its own size.
+rows = 30
+cols = 100
+
+# Every new tab starts this set of panes, in the directory chosen in the
+# browser. Tabs are not created at startup; they are created on demand.
+# An empty `command` starts the user's $SHELL. Four slots are available:
+# top-left, top-right, bottom-left, bottom-right. Omitted slots stay empty.
+
+[[new_tab.panes]]
+slot = "top-left"
+name = "pi"
+command = ["pi"]
+
+[[new_tab.panes]]
+slot = "bottom-left"
+name = "pi"
+command = ["pi"]
+
+[[new_tab.panes]]
+slot = "top-right"
+name = "emacs"
+command = ["emacs", "-nw"]
+
+[[new_tab.panes]]
+slot = "bottom-right"
+name = "shell"
+command = []

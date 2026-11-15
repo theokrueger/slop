@@ -198,12 +198,16 @@
     return state.group === "user" ? user : model;
   }
 
-  function aggregate() {
+  function windowRange() {
     const size = state.data.bucket_secs;
-    const now = state.data.generated_at;
-    const end = Math.floor(now / size) * size;
+    const end = Math.floor(state.data.generated_at / size) * size;
     const count = Math.max(1, Math.ceil(state.range / size));
     const start = end - (count - 1) * size;
+    return { size, start, end, count };
+  }
+
+  function aggregate() {
+    const { size, start, end, count } = windowRange();
 
     const buckets = [];
     const index = new Map();
@@ -232,13 +236,14 @@
   }
 
   function rawTotals() {
-    const cutoff = state.data.generated_at - state.range;
+    const cutoff = windowRange().start;
     const perUser = new Map();
     const models = new Set();
     let total = 0;
     for (const bucket of state.data.buckets) {
       if (bucket.start < cutoff) continue;
       for (const [user, counts] of Object.entries(bucket.counts)) {
+        if (state.user && user !== state.user) continue;
         let row = perUser.get(user);
         if (!row) {
           row = new Map();
@@ -550,7 +555,7 @@
     totalRow.className = "total";
     const allHead = document.createElement("th");
     allHead.scope = "row";
-    allHead.textContent = "All users";
+    allHead.textContent = state.user ? "Total" : "All users";
     totalRow.append(allHead);
     for (const model of columns) {
       totalRow.append(cell(formatCount(columnTotals.get(model))));

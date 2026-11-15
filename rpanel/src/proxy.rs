@@ -101,37 +101,12 @@ async fn forward_upgrade(
     let downstream = hyper::upgrade::on(&mut req);
     let (parts, body) = req.into_parts();
 
-    let mut builder = Request::builder()
-        .method(parts.method.clone())
-        .uri(uri)
-        .version(hyper::Version::HTTP_11);
-    let headers = builder
-        .headers_mut()
-        .context("request builder has no headers")?;
-    copy_upgrade_headers(&parts.headers, headers);
-    headers.insert(
-        header::HOST,
-        HeaderValue::from_str(&route.host).context("invalid upstream host")?,
-    );
-    rewrite_origin_headers(headers, route);
-    if let Some(ip) = client_ip {
-        append_forwarded(headers, X_FORWARDED_FOR, &ip.to_string());
-        headers.insert(
-            X_REAL_IP,
-            HeaderValue::from_str(&ip.to_string()).context("invalid client IP")?,
-        );
-    }
-    if let Some(host) = parts.headers.get(header::HOST) {
-        headers.insert(X_FORWARDED_HOST, host.clone());
-    }
-    headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(proto));
-    if let Some(prefix) = route.forwarded_prefix()
-        && let Ok(value) = HeaderValue::from_str(prefix)
-    {
-        headers.insert(X_FORWARDED_PREFIX, value);
-    }
+    let mut request = Request::new(body);
+    *request.version_mut() = hyper::Version::HTTP_11;
+    copy_upstream_headers(request.headers_mut(), &parts, route, client_ip, proto, true)?;
+    *request.method_mut() = parts.method;
+    *request.uri_mut() = uri;
 
-    let request = builder.body(body).context("building upstream request")?;
     let mut response = tokio::time::timeout(UPSTREAM_TIMEOUT, client.request(request))
         .await
         .context("upstream timed out")?
@@ -139,17 +114,7 @@ async fn forward_upgrade(
 
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
         // The upstream declined the upgrade; relay its response as a normal one.
-        let (parts, body) = response.into_parts();
-        let mut builder = Response::builder()
-            .status(parts.status)
-            .version(parts.version);
-        let headers = builder
-            .headers_mut()
-            .context("response builder has no headers")?;
-        copy_headers(&parts.headers, headers);
-        return builder
-            .body(Body::new(body))
-            .context("building downstream response");
+        return Ok(relay_response(response));
     }
 
     let upstream = hyper::upgrade::on(&mut response);
@@ -167,40 +132,18 @@ async fn forward_upgrade(
                 return;
             }
         };
-        let (mut down_read, mut down_write) = tokio::io::split(TokioIo::new(down));
-        let (mut up_read, mut up_write) = tokio::io::split(TokioIo::new(up));
-        tokio::select! {
-            result = tokio::io::copy(&mut down_read, &mut up_write) => {
-                if let Err(error) = result {
-                    warn!(%error, "upgraded client->upstream copy failed");
-                }
-            }
-            result = tokio::io::copy(&mut up_read, &mut down_write) => {
-                if let Err(error) = result {
-                    warn!(%error, "upgraded upstream->client copy failed");
-                }
-            }
+        let mut down = TokioIo::new(down);
+        let mut up = TokioIo::new(up);
+        // Copy both directions until each side closes its write half, so a
+        // client half-close does not truncate the upstream response.
+        if let Err(error) = tokio::io::copy_bidirectional(&mut down, &mut up).await {
+            warn!(%error, "upgraded connection copy failed");
         }
     });
 
     // Relay the 101 handshake response; hyper flushes it and upgrades the
     // downstream connection, which resolves the `downstream` future above.
-    let (parts, _body) = response.into_parts();
-    let mut builder = Response::builder()
-        .status(parts.status)
-        .version(parts.version);
-    let headers = builder
-        .headers_mut()
-        .context("response builder has no headers")?;
-    copy_headers(&parts.headers, headers);
-    for name in [header::CONNECTION, header::UPGRADE] {
-        if let Some(value) = parts.headers.get(&name) {
-            headers.insert(name, value.clone());
-        }
-    }
-    builder
-        .body(Body::empty())
-        .context("building downstream response")
+    Ok(relay_upgrade_response(response))
 }
 
 async fn forward(
@@ -213,59 +156,132 @@ async fn forward(
 ) -> Result<Response> {
     let (parts, body) = req.into_parts();
 
-    let mut builder = Request::builder().method(parts.method).uri(uri);
-    let headers = builder
-        .headers_mut()
-        .context("request builder has no headers")?;
-    copy_headers(&parts.headers, headers);
-    headers.insert(
-        header::HOST,
-        HeaderValue::from_str(&route.host).context("invalid upstream host")?,
-    );
-    rewrite_origin_headers(headers, route);
-    if let Some(ip) = client_ip {
-        append_forwarded(headers, X_FORWARDED_FOR, &ip.to_string());
-        headers.insert(
-            X_REAL_IP,
-            HeaderValue::from_str(&ip.to_string()).context("invalid client IP")?,
-        );
-    }
-    if let Some(host) = parts.headers.get(header::HOST) {
-        headers.insert(X_FORWARDED_HOST, host.clone());
-    }
-    headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(proto));
-    if let Some(prefix) = route.forwarded_prefix()
-        && let Ok(value) = HeaderValue::from_str(prefix)
-    {
-        headers.insert(X_FORWARDED_PREFIX, value);
-    }
+    let mut request = Request::new(body);
+    copy_upstream_headers(
+        request.headers_mut(),
+        &parts,
+        route,
+        client_ip,
+        proto,
+        false,
+    )?;
+    *request.method_mut() = parts.method;
+    *request.uri_mut() = uri;
 
-    let request = builder.body(body).context("building upstream request")?;
     let response = tokio::time::timeout(UPSTREAM_TIMEOUT, client.request(request))
         .await
         .context("upstream timed out")?
         .context("upstream request failed")?;
 
-    let (parts, body) = response.into_parts();
-    let mut builder = Response::builder()
-        .status(parts.status)
-        .version(parts.version);
-    let headers = builder
-        .headers_mut()
-        .context("response builder has no headers")?;
-    copy_headers(&parts.headers, headers);
-    builder
-        .body(Body::new(body))
-        .context("building downstream response")
+    Ok(relay_response(response))
 }
 
-/// Rewrites `Origin` and `Referer` to the upstream origin so CSRF checks
-/// that compare them against the rewritten `Host` header keep working.
-fn rewrite_origin_headers(headers: &mut HeaderMap, route: &Route) {
+/// Copies end-to-end request headers to `target` and adds the forwarding
+/// headers rpanel sets. When `upgrade` is set, the `Connection`/`Upgrade`
+/// handshake headers are kept instead of stripped as hop-by-hop headers.
+fn copy_upstream_headers(
+    target: &mut HeaderMap,
+    parts: &http::request::Parts,
+    route: &Route,
+    client_ip: Option<IpAddr>,
+    proto: &'static str,
+    upgrade: bool,
+) -> Result<()> {
+    let source = &parts.headers;
+    if upgrade {
+        copy_upgrade_headers(source, target);
+    } else {
+        copy_headers(source, target);
+    }
+
+    target.insert(
+        header::HOST,
+        HeaderValue::from_str(&route.host).context("invalid upstream host")?,
+    );
+
+    // The host the client used, for deciding whether `Origin`/`Referer` are
+    // same-origin. HTTP/2 carries it as `:authority` rather than `Host`.
+    let public_host = parts
+        .uri
+        .authority()
+        .map(|authority| authority.as_str())
+        .or_else(|| {
+            source
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+        });
+    rewrite_origin_headers(target, route, public_host);
+
+    if let Some(ip) = client_ip {
+        let ip = ip.to_string();
+        append_forwarded(target, X_FORWARDED_FOR, &ip);
+        target.insert(
+            X_REAL_IP,
+            HeaderValue::from_str(&ip).context("invalid client IP")?,
+        );
+    }
+    if let Some(host) = source.get(header::HOST) {
+        target.insert(X_FORWARDED_HOST, host.clone());
+    } else if let Some(authority) = parts.uri.authority()
+        && let Ok(value) = HeaderValue::from_str(authority.as_str())
+    {
+        target.insert(X_FORWARDED_HOST, value);
+    }
+    target.insert(X_FORWARDED_PROTO, HeaderValue::from_static(proto));
+    if let Some(prefix) = route.forwarded_prefix()
+        && let Ok(value) = HeaderValue::from_str(prefix)
+    {
+        target.insert(X_FORWARDED_PREFIX, value);
+    }
+    Ok(())
+}
+
+/// Converts an upstream response into a downstream one, dropping hop-by-hop
+/// headers.
+fn relay_response(response: hyper::Response<hyper::body::Incoming>) -> Response {
+    let (parts, body) = response.into_parts();
+    let mut response = Response::new(Body::new(body));
+    *response.status_mut() = parts.status;
+    *response.version_mut() = parts.version;
+    copy_headers(&parts.headers, response.headers_mut());
+    response
+}
+
+/// Relays a `101 Switching Protocols` response, preserving the `Connection`
+/// and `Upgrade` headers needed by the tunnel.
+fn relay_upgrade_response(response: hyper::Response<hyper::body::Incoming>) -> Response {
+    let (parts, _body) = response.into_parts();
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = parts.status;
+    *response.version_mut() = parts.version;
+    let headers = response.headers_mut();
+    copy_headers(&parts.headers, headers);
+    for name in [header::CONNECTION, header::UPGRADE] {
+        if let Some(value) = parts.headers.get(&name) {
+            headers.insert(name, value.clone());
+        }
+    }
+    response
+}
+
+/// Rewrites `Origin` and `Referer` to the upstream origin for same-origin
+/// requests, so CSRF checks that compare them against the rewritten `Host`
+/// header keep working. Cross-origin values are left untouched: rewriting
+/// those would let any site bypass the upstream's CSRF protection.
+fn rewrite_origin_headers(headers: &mut HeaderMap, route: &Route, public_host: Option<&str>) {
+    let Some(public_host) = public_host else {
+        return;
+    };
     let scheme = if route.https { "https" } else { "http" };
     let origin = format!("{scheme}://{}", route.host);
 
-    if headers.contains_key(header::ORIGIN) {
+    if let Some(value) = headers.get(header::ORIGIN)
+        && value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<Uri>().ok())
+            .is_some_and(|uri| same_authority(&uri, public_host))
+    {
         match HeaderValue::from_str(&origin) {
             Ok(value) => {
                 headers.insert(header::ORIGIN, value);
@@ -276,24 +292,29 @@ fn rewrite_origin_headers(headers: &mut HeaderMap, route: &Route) {
         }
     }
 
-    if let Some(referer) = headers.get(header::REFERER).cloned() {
-        let rewritten = referer
+    if let Some(referer) = headers.get(header::REFERER).cloned()
+        && let Some(uri) = referer
             .to_str()
             .ok()
             .and_then(|value| value.parse::<Uri>().ok())
-            .and_then(|uri| {
-                let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-                format!("{origin}{path}").parse::<HeaderValue>().ok()
-            });
-        match rewritten {
-            Some(value) => {
+        && same_authority(&uri, public_host)
+    {
+        let path = uri.path_and_query().map_or("/", |pq| pq.as_str());
+        match format!("{origin}{path}").parse::<HeaderValue>() {
+            Ok(value) => {
                 headers.insert(header::REFERER, value);
             }
-            None => {
+            Err(_) => {
                 headers.remove(header::REFERER);
             }
         }
     }
+}
+
+/// Whether `uri` points at the authority the client used to reach rpanel.
+fn same_authority(uri: &Uri, public_host: &str) -> bool {
+    uri.authority()
+        .is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(public_host))
 }
 
 /// Redirects a bare prefix to its trailing-slash form when both an exact
@@ -312,7 +333,7 @@ fn trailing_slash_redirect(routes: &[Route], path: &str, query: Option<&str>) ->
     let with_slash = format!("{path}/");
     let wildcard = routes
         .iter()
-        .any(|route| route.is_wildcard() && route.capture(&with_slash).is_some());
+        .any(|route| route.is_wildcard() && route.prefix() == with_slash);
     if !wildcard {
         return None;
     }
@@ -422,6 +443,25 @@ mod tests {
     }
 
     #[test]
+    fn does_not_redirect_an_exact_route_shadowed_by_a_catch_all() {
+        let group = |host: &str, from: &str, to: &str| crate::config::Group {
+            host: host.into(),
+            https: false,
+            paths: [(from.to_string(), to.to_string())].into_iter().collect(),
+            forwarded_prefix: false,
+        };
+        let routes = crate::route::build_routes(&indexmap::IndexMap::from([
+            ("root".to_string(), group("root:1", "/*", "/root/*")),
+            (
+                "health".to_string(),
+                group("health:1", "/health", "/health"),
+            ),
+        ]));
+
+        assert_eq!(trailing_slash_redirect(&routes, "/health", None), None);
+    }
+
+    #[test]
     fn rewrites_origin_and_referer_to_upstream() {
         let group = crate::config::Group {
             host: "nastty.local:8080".into(),
@@ -437,13 +477,38 @@ mod tests {
             HeaderValue::from_static("https://cow/qbittorrent/"),
         );
 
-        rewrite_origin_headers(&mut headers, &route);
+        rewrite_origin_headers(&mut headers, &route, Some("cow"));
 
         assert_eq!(headers[header::ORIGIN], "https://nastty.local:8080");
         assert_eq!(
             headers[header::REFERER],
             "https://nastty.local:8080/qbittorrent/"
         );
+    }
+
+    #[test]
+    fn leaves_cross_origin_headers_untouched() {
+        let group = crate::config::Group {
+            host: "nastty.local:8080".into(),
+            https: true,
+            paths: Default::default(),
+            forwarded_prefix: false,
+        };
+        let route = Route::new("qbit", &group, "/qbittorrent/*", "/*");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.test"),
+        );
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("https://evil.test/qbittorrent/"),
+        );
+
+        rewrite_origin_headers(&mut headers, &route, Some("cow"));
+
+        assert_eq!(headers[header::ORIGIN], "https://evil.test");
+        assert_eq!(headers[header::REFERER], "https://evil.test/qbittorrent/");
     }
 
     #[test]

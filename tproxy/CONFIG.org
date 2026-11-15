@@ -19,7 +19,7 @@ touch "${XDG_CONFIG_HOME:-$HOME/.config}/tproxy.yaml"
 #+begin_src yaml
 server:
   host: "127.0.0.1"
-  port: "8001"
+  port: 8001
 
 models:
   "my-model":
@@ -38,17 +38,19 @@ users:
 | Field                     | Default     | Description                            |
 |---------------------------+-------------+----------------------------------------|
 | =host=                    | =127.0.0.1= | Bind address.                          |
-| =port=                    | ="8001"=    | Bind port.                             |
+| =port=                    | =8001=      | Bind port. Quoted values are also accepted. |
 | =log=                     | unset       | Append log file; stdout when omitted.  |
 | =rate_limit=              | =100=       | Requests/minute per user.              |
 | =max_concurrency=         | =128=       | In-flight requests before =503=.       |
 | =allow_insecure_upstream= | =false=     | Allow remote plaintext HTTP upstreams. |
 
 A =rate_limit= of =0= disables the per-user limiter. Rate limits use in-memory
-token buckets.
+token buckets. Unknown keys are rejected, so a typo stops the server at
+startup instead of silently falling back to a default.
 
-Config and log files are written with mode =0600=. tproxy warns if the config
-is group/world-accessible.
+Config and log files are written with mode =0600=; newly created parent
+directories use mode =0700=. tproxy warns if the config is accessible by
+other users.
 
 * Models
 
@@ -71,8 +73,8 @@ When set, =modelname=, =name=, and =api_key= must be non-empty. Cost fields
 are =input=, =output=, =cache_read=, and =cache_write=.
 =/v1/chat/completions= is forwarded to =ENDPOINT/chat/completions=; the =/v1=
 prefix is stripped and query strings are kept. Endpoints must use HTTP or
-HTTPS, must not contain credentials, and remote plaintext HTTP requires
-=allow_insecure_upstream: true=.
+HTTPS, must not contain credentials or a query string/fragment, and remote
+plaintext HTTP requires =allow_insecure_upstream: true=.
 
 Model metadata is served by =GET /v1/models=. The model list is built at
 startup; restart tproxy after changing models.
@@ -80,8 +82,8 @@ startup; restart tproxy after changing models.
 * Users
 
 =users= maps names to API keys. Clients send =Authorization: Bearer <key>=.
-Keys must be non-empty and must not contain whitespace. Generate keys with
-=tproxy useradd alice=.
+Keys must be non-empty, must not contain whitespace, and must be unique across
+users. Generate keys with =tproxy useradd alice=.
 
 Keys and upstream API keys are stored in plaintext; keep the config private.
 Short keys produce a startup warning.
