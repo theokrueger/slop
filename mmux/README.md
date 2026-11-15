@@ -7,24 +7,30 @@ running inside it. Several browsers can attach to the same session and share
 the same panes.
 
 - Four-slot pane grid: **top-left**, **top-right**, **bottom-left**, **bottom-right**
-- Vertical tab list; tabs can be created, renamed (double-click), and closed
-- A new tab starts the configured pane template in a working directory chosen
-  through an interactive directory picker
-- No tabs are open on startup
-- Copy with `Ctrl+Insert`, or `Ctrl+C` when text is selected (`Ctrl+C` without
-  a selection is still sent as SIGINT); OSC 52 copies from programs are
-  forwarded to the browser clipboard
+- Vertical project list; projects can be created, renamed (double-click), and
+  closed
+- A new project starts the configured pane template in a working directory
+  chosen through an interactive directory picker
+- No projects are open on a fresh install
+- Projects, their working directories, and their pane definitions persist
+  across mmux restarts
+- Copy with `Ctrl+Insert`, `Ctrl+Shift+C`, or `Ctrl+C` when text is selected
+  (`Ctrl+C` without a selection is still sent as SIGINT); OSC 52 copies from
+  programs are forwarded to the browser clipboard
+- `Ctrl+Shift+Arrow` moves focus between panes (up, down, left, right)
 - Paste with `Ctrl+Shift+V` or `Shift+Insert`; right-click also works
-- `Ctrl+Shift+C` is used by browser DevTools in Chrome/Firefox, so the
-  shortcuts above are the reliable ones
+- Some browsers reserve `Ctrl+Shift+C` for DevTools. mmux intercepts it in the
+  capture phase; if your browser still handles it first, use `Ctrl+Insert` or
+  `Ctrl+C` with a selection.
 - Linux username/password login through PAM; no mmux-specific accounts
 - Server-side terminal emulation with reconnect snapshots and incremental
   screen diffs
 - Small, dependency-light frontend; xterm.js is vendored, no CDN required
 - Relative URLs, so it can be mounted behind a path-prefix reverse proxy
 
-The default new-tab layout is two `pi` sessions on the left, `emacs -nw` in the
-top-right, and a shell in the bottom-right. Every part of that is configurable.
+The default new-project layout is two `pi` sessions on the left,
+`emacs -nw` in the top-right, and a shell in the bottom-right. Every part of
+that is configurable.
 
 ## Requirements
 
@@ -61,12 +67,38 @@ Configuration is read from `$XDG_CONFIG_HOME/mmux/config.toml` by default.
 `--config PATH` and `MMUX_CONFIG` select another file. `--bind ADDR` and
 `MMUX_BIND` override the listen address.
 
+## Projects and persistence
+
+The vertical list contains **projects**. Each project owns up to four panes
+and a working directory. Projects are durable: after creation, rename, close,
+and shutdown, mmux writes their names, working directories, and pane
+definitions to:
+
+```text
+$XDG_STATE_HOME/mmux/projects.json
+```
+
+On the next start, mmux restores those projects and starts fresh panes in their
+saved working directories. Running processes cannot be serialized, so agents
+and editors are relaunched; the project list itself is preserved across
+restarts and reboots. Pi panes using the default `{session_id}` placeholder
+resume their conversation history because the resolved
+`--session-id` is persisted with the project. Panes created before the
+placeholder existed keep their original commands; if they are pi sessions,
+resume them manually with `pi --resume` or recreate the project. If a saved
+directory or command no longer exists, the project is still restored and the
+affected pane shows its startup error.
+
+Delete the state file to start with no projects.
+
 ## How sessions behave
 
-- PTYs, terminal state, tabs, and pane processes live in the mmux server. A
+- PTYs, terminal state, projects, and pane processes live in the mmux server. A
   browser WebSocket is only a viewer.
 - Disconnecting all browsers pauses nothing. Reconnecting (or opening a second
   browser) replays the current screen.
+- Restarting mmux ends the running processes, but restores the persisted
+  projects and starts their panes again.
 - Multiple browsers share input and output for a pane, like attaching to the
   same tmux window.
 - Shared pane size is the smallest viewport among attached browsers, also like
@@ -94,21 +126,21 @@ root = "~"               # directory picker confinement
 rows = 30
 cols = 100
 
-# Used for every newly created tab. Tabs are created from the UI, in the
-# directory chosen there; they are not created at startup.
-[[new_tab.panes]]
+# Used for every newly created project. Projects are created from the UI in
+# the directory chosen there, and persisted for the next mmux start.
+[[new_project.panes]]
 slot = "top-left"
-command = ["pi"]
+command = ["pi", "--session-id", "{session_id}"]
 
-[[new_tab.panes]]
+[[new_project.panes]]
 slot = "bottom-left"
-command = ["pi"]
+command = ["pi", "--session-id", "{session_id}"]
 
-[[new_tab.panes]]
+[[new_project.panes]]
 slot = "top-right"
 command = ["emacs", "-nw"]
 
-[[new_tab.panes]]
+[[new_project.panes]]
 slot = "bottom-right"
 command = []
 ```
@@ -117,6 +149,11 @@ command = []
   Unused slots are omitted and the grid collapses accordingly.
 - An omitted or empty `command` starts `$SHELL`.
 - `env` adds per-pane environment variables.
+- `{session_id}` is replaced once per pane when a project is created with a
+  fresh UUID. The resolved command is stored with the project, so programs that
+  accept a stable session ID can resume after a restart. The default `pi`
+  commands pass it via `--session-id`. Commands without the placeholder are
+  left untouched.
 - Pane commands inherit mmux's environment. Under systemd, set a suitable
   `PATH` (or use absolute program paths). The supplied unit starts mmux
   through a login shell and sets a PATH that covers the default `pi` panes;
@@ -231,7 +268,8 @@ binary.
 src/
   auth.rs          PAM authentication + Unix account detection
   config.rs        TOML config, defaults, validation
-  session/         tabs, panes, PTY ownership, terminal snapshots
+  persistence.rs   durable project registry
+  session/         projects, panes, PTY ownership, terminal snapshots
   web/             axum routes, login/session handling, WebSocket protocol
   workspace.rs     confined directory picker
 web/               embedded frontend (vendored xterm.js)

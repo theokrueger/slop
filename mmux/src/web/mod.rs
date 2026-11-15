@@ -103,10 +103,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/state", get(api::state))
         .route("/api/events", get(api::events))
         .route("/api/fs", get(api::list_directory))
-        .route("/api/tabs", post(api::create_tab))
+        .route("/api/projects", post(api::create_project))
         .route(
-            "/api/tabs/{id}",
-            patch(api::rename_tab).delete(api::close_tab),
+            "/api/projects/{id}",
+            patch(api::rename_project).delete(api::close_project),
         )
         .route("/ws/panes/{id}", get(ws::pane_socket))
         .fallback(not_found)

@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 use vt100::{Callbacks, Parser, Screen};
 
 use crate::config::Slot;
-use crate::session::{PaneId, SessionEvent, TabId};
+use crate::session::{PaneId, ProjectId, SessionEvent};
 
 pub const MIN_ROWS: u16 = 5;
 pub const MIN_COLS: u16 = 10;
@@ -67,25 +67,34 @@ pub enum PaneStatusView {
     },
 }
 
-/// A full terminal snapshot and the screen state that produced it.
+/// A full terminal snapshot and the output sequence it represents.
 pub struct Snapshot {
     pub rows: u16,
     pub cols: u16,
     pub data: String,
-    pub screen: Screen,
+    pub seq: u64,
 }
 
-/// An incremental terminal update.
-pub struct Update {
-    pub data: String,
-    pub screen: Screen,
+/// A chunk of raw PTY output, with a contiguous sequence range.
+#[derive(Debug, Clone)]
+pub struct OutputChunk {
+    pub start: u64,
+    pub data: Arc<[u8]>,
+}
+
+impl OutputChunk {
+    pub fn end(&self) -> u64 {
+        self.start
+            .saturating_add(self.data.len() as u64)
+            .saturating_sub(1)
+    }
 }
 
 /// One PTY-backed terminal. The pane outlives browser connections: its reader
 /// and waiter threads are owned by the session, not by any WebSocket.
 pub struct Pane {
     id: PaneId,
-    tab_id: TabId,
+    project_id: ProjectId,
     slot: Slot,
     command: Vec<String>,
     cwd: PathBuf,
@@ -93,6 +102,7 @@ pub struct Pane {
     process: Mutex<Option<Process>>,
     clients: Mutex<HashMap<u64, ClientSize>>,
     clipboard: broadcast::Sender<String>,
+    output: broadcast::Sender<OutputChunk>,
     closed: AtomicBool,
     events: broadcast::Sender<SessionEvent>,
 }
@@ -100,6 +110,7 @@ pub struct Pane {
 struct PaneState {
     parser: Parser<PaneCallbacks>,
     status: PaneStatus,
+    output_seq: u64,
 }
 
 /// Answers the handful of terminal queries that interactive programs use to
@@ -214,7 +225,7 @@ impl Pane {
     /// pane (and reported as an exited status) instead of disappearing.
     pub fn spawn(
         id: PaneId,
-        tab_id: TabId,
+        project_id: ProjectId,
         slot: Slot,
         spec: PaneSpec,
         size: (u16, u16),
@@ -223,20 +234,23 @@ impl Pane {
         let (rows, cols) = sanitize_size(size.0, size.1);
         let parser = Parser::new_with_callbacks(rows, cols, 0, PaneCallbacks::default());
         let (clipboard, _) = broadcast::channel(64);
+        let (output, _) = broadcast::channel(512);
         let started = Self::start_process(&spec, rows.get(), cols.get());
         let pane = Arc::new(Self {
             id,
-            tab_id,
+            project_id,
             slot,
             command: spec.command,
             cwd: spec.cwd,
             state: Mutex::new(PaneState {
                 parser,
                 status: PaneStatus::Running,
+                output_seq: 0,
             }),
             process: Mutex::new(None),
             clients: Mutex::new(HashMap::new()),
             clipboard,
+            output,
             closed: AtomicBool::new(false),
             events,
         });
@@ -338,15 +352,25 @@ impl Pane {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
-                        let (responses, clipboard) = {
+                        let (responses, clipboard, chunk) = {
                             let mut state = pane.state.lock();
                             state.parser.process(&buffer[..count]);
+                            state.output_seq += count as u64;
+                            let start = state.output_seq - count as u64 + 1;
                             let callbacks = state.parser.callbacks_mut();
-                            (callbacks.take_responses(), callbacks.take_clipboard())
+                            (
+                                callbacks.take_responses(),
+                                callbacks.take_clipboard(),
+                                OutputChunk {
+                                    start,
+                                    data: Arc::<[u8]>::from(&buffer[..count]),
+                                },
+                            )
                         };
                         for text in clipboard {
                             let _ = pane.clipboard.send(text);
                         }
+                        let _ = pane.output.send(chunk);
                         if !responses.is_empty()
                             && let Err(err) = pane.write_input(responses.as_bytes())
                         {
@@ -413,7 +437,7 @@ impl Pane {
             };
         }
         let _ = self.events.send(SessionEvent::PaneExited {
-            tab_id: self.tab_id,
+            project_id: self.project_id,
             pane_id: self.id,
         });
     }
@@ -430,7 +454,7 @@ impl Pane {
         // drains any remaining output before it observes EOF.
         let _ = self.process.lock().take();
         let _ = self.events.send(SessionEvent::PaneExited {
-            tab_id: self.tab_id,
+            project_id: self.project_id,
             pane_id: self.id,
         });
     }
@@ -439,8 +463,8 @@ impl Pane {
         self.id
     }
 
-    pub fn tab_id(&self) -> TabId {
-        self.tab_id
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
     }
 
     pub fn slot(&self) -> Slot {
@@ -483,37 +507,31 @@ impl Pane {
         let state = self.state.lock();
         let screen = state.parser.screen();
         let (rows, cols) = screen.size();
+        let mut data = String::new();
+        // Snapshots are applied after a client-side reset, so reproduce the
+        // alternate-screen selection along with the visible contents.
+        if screen.alternate_screen() {
+            data.push_str("\x1b[?1049h");
+        } else {
+            data.push_str("\x1b[?1049l");
+        }
+        data.push_str(&screen.state_formatted());
         Snapshot {
             rows: rows.get(),
             cols: cols.get(),
-            data: screen.state_formatted(),
-            screen: screen.clone(),
-        }
-    }
-
-    /// Computes the escape sequence needed to move a terminal showing
-    /// `previous` to the current screen. Returns `None` when nothing changed
-    /// or when the size changed (which requires a full snapshot).
-    pub fn update(&self, previous: &Screen) -> Option<Update> {
-        let state = self.state.lock();
-        let screen = state.parser.screen();
-        if screen.size() != previous.size() {
-            return None;
-        }
-        let data = screen.state_diff(previous);
-        if data.is_empty() {
-            None
-        } else {
-            Some(Update {
-                data,
-                screen: screen.clone(),
-            })
+            data,
+            seq: state.output_seq,
         }
     }
 
     /// Clipboard writes requested by the pane's program via OSC 52.
     pub fn subscribe_clipboard(&self) -> broadcast::Receiver<String> {
         self.clipboard.subscribe()
+    }
+
+    /// Raw PTY output for live browser clients.
+    pub fn subscribe_output(&self) -> broadcast::Receiver<OutputChunk> {
+        self.output.subscribe()
     }
 
     pub fn write_input(&self, bytes: &[u8]) -> io::Result<()> {
@@ -682,7 +700,7 @@ mod tests {
         let (events, _) = broadcast::channel(16);
         Pane::spawn(
             PaneId::new(1),
-            TabId::new(1),
+            ProjectId::new(1),
             Slot::TopLeft,
             spec(command, cwd),
             (24, 80),
@@ -743,16 +761,31 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_and_update_round_trip() {
+    fn snapshots_and_raw_chunks_cover_output() {
         let dir = cwd();
-        let pane = test_pane(vec!["sh", "-c", "printf hello; sleep 5"], dir.path());
+        let pane = test_pane(vec!["sh"], dir.path());
         assert!(wait_for(
             || !pane.contents().trim().is_empty(),
             Duration::from_secs(5)
         ));
+        let mut output = pane.subscribe_output();
+        pane.write_input(b"printf 'RAW_HELLO\\n'\n").unwrap();
+        let mut text = String::new();
+        assert!(
+            wait_for(
+                || {
+                    while let Ok(chunk) = output.try_recv() {
+                        text.push_str(&String::from_utf8_lossy(&chunk.data));
+                    }
+                    text.contains("RAW_HELLO")
+                },
+                Duration::from_secs(5)
+            ),
+            "raw output: {text:?}"
+        );
         let snapshot = pane.snapshot();
-        assert!(snapshot.data.contains("hello"));
-        assert!(pane.update(&snapshot.screen).is_none());
+        assert!(snapshot.data.contains("RAW_HELLO"));
+        assert!(snapshot.seq > 0);
         pane.kill();
     }
 

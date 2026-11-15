@@ -16,9 +16,9 @@
     <aside class="sidebar">
       <div class="brand">mmux</div>
 
-      <nav id="tabs" class="tabs" aria-label="Tabs"></nav>
+      <nav id="projects" class="projects" aria-label="Projects"></nav>
 
-      <button id="new-tab" class="new-tab" type="button">+ new tab</button>
+      <button id="new-project" class="new-project" type="button">+ new project</button>
 
       <div class="sidebar-footer">
         <span id="user" class="user"></span>
@@ -29,20 +29,20 @@
     <main id="main" class="main">
       <div id="panes" class="panes"></div>
       <div id="empty-state" class="empty-state" hidden>
-        <p class="empty-title">No tabs open</p>
-        <p class="empty-hint">Start a workspace in the directory you want to work in.</p>
-        <button id="empty-new-tab" type="button">New tab</button>
+        <p class="empty-title">No projects open</p>
+        <p class="empty-hint">Open a project in the directory you want to work in.</p>
+        <button id="empty-new-project" type="button">New project</button>
       </div>
     </main>
   </div>
 
-  <dialog id="new-tab-dialog" class="dialog">
-    <form id="new-tab-form" method="dialog">
-      <h2>New tab</h2>
+  <dialog id="new-project-dialog" class="dialog">
+    <form id="new-project-form" method="dialog">
+      <h2>New project</h2>
 
       <label class="field">
         <span>Name</span>
-        <input id="new-tab-name" type="text" maxlength="80" autocomplete="off" spellcheck="false">
+        <input id="new-project-name" type="text" maxlength="80" autocomplete="off" spellcheck="false">
       </label>
 
       <label class="field">
@@ -57,7 +57,7 @@
 
       <div class="dialog-actions">
         <button id="dialog-cancel" class="button" type="button">Cancel</button>
-        <button id="dialog-create" class="button primary" type="submit">Create tab</button>
+        <button id="dialog-create" class="button primary" type="submit">Create project</button>
       </div>
     </form>
   </dialog>

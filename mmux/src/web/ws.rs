@@ -6,11 +6,12 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::time::MissedTickBehavior;
 
 use super::{AppState, AuthUser};
 use crate::session::PaneId;
-use crate::session::pane::{Pane, Snapshot};
+use crate::session::pane::{OutputChunk, Pane, Snapshot};
 
 /// Client -> server frame tags.
 const CLIENT_RESIZE: u8 = 0;
@@ -18,10 +19,10 @@ const CLIENT_INPUT: u8 = 1;
 
 /// Server -> client frame tags.
 const SERVER_FULL: u8 = 0;
-const SERVER_DIFF: u8 = 1;
 const SERVER_CLIPBOARD: u8 = 2;
+const SERVER_DATA: u8 = 3;
 
-const TICK: Duration = Duration::from_millis(33);
+const TICK: Duration = Duration::from_millis(100);
 
 pub async fn pane_socket(
     State(state): State<AppState>,
@@ -40,11 +41,16 @@ pub async fn pane_socket(
 async fn run(socket: WebSocket, pane: std::sync::Arc<Pane>, client_id: u64) {
     let (mut sink, mut stream) = socket.split();
     let mut clipboard = pane.subscribe_clipboard();
+    // Subscribe before taking the snapshot. Chunks older than the snapshot's
+    // sequence are skipped, so output between these two operations is neither
+    // lost nor duplicated.
+    let mut output = pane.subscribe_output();
     let snapshot = pane.snapshot();
     if send_full(&mut sink, &snapshot).await.is_err() {
         return;
     }
-    let mut previous = snapshot.screen;
+    let mut sent_seq = snapshot.seq;
+    let mut screen_size = (snapshot.rows, snapshot.cols);
     let _ = pane.attach_client(client_id, snapshot.cols, snapshot.rows);
     tracing::debug!(
         pane = pane.id().get(),
@@ -57,30 +63,44 @@ async fn run(socket: WebSocket, pane: std::sync::Arc<Pane>, client_id: u64) {
 
     loop {
         tokio::select! {
+            chunk = output.recv() => {
+                match chunk {
+                    Ok(chunk) => {
+                        if chunk.end() <= sent_seq {
+                            continue;
+                        }
+                        if chunk.start != sent_seq + 1 {
+                            // A gap means the client missed output; replace its
+                            // screen with a fresh snapshot and continue.
+                            if !resync(&mut sink, &pane, &mut sent_seq, &mut screen_size).await {
+                                break;
+                            }
+                            continue;
+                        }
+                        if send_data(&mut sink, &chunk).await.is_err() {
+                            break;
+                        }
+                        sent_seq = chunk.end();
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        tracing::debug!(pane = pane.id().get(), skipped, "terminal output lagged");
+                        if !resync(&mut sink, &pane, &mut sent_seq, &mut screen_size).await {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Closed) => {}
+                }
+            }
             _ = ticker.tick() => {
                 if pane.is_closed() {
                     let _ = sink.send(Message::Close(None)).await;
                     break;
                 }
-                let (rows, cols) = pane.size();
-                let (prev_rows, prev_cols) = {
-                    let (rows, cols) = previous.size();
-                    (rows.get(), cols.get())
-                };
-                if (rows, cols) != (prev_rows, prev_cols) {
-                    let snapshot = pane.snapshot();
-                    if send_full(&mut sink, &snapshot).await.is_err() {
-                        break;
-                    }
-                    previous = snapshot.screen;
-                } else if let Some(update) = pane.update(&previous) {
-                    let mut payload = Vec::with_capacity(1 + update.data.len());
-                    payload.push(SERVER_DIFF);
-                    payload.extend_from_slice(update.data.as_bytes());
-                    if sink.send(Message::Binary(Bytes::from(payload))).await.is_err() {
-                        break;
-                    }
-                    previous = update.screen;
+                let size = pane.size();
+                if size != screen_size
+                    && !resync(&mut sink, &pane, &mut sent_seq, &mut screen_size).await
+                {
+                    break;
                 }
             }
             clip = clipboard.recv() => {
@@ -90,10 +110,10 @@ async fn run(socket: WebSocket, pane: std::sync::Arc<Pane>, client_id: u64) {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    Err(RecvError::Lagged(skipped)) => {
                         tracing::debug!(pane = pane.id().get(), skipped, "clipboard events lagged");
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                    Err(RecvError::Closed) => {}
                 }
             }
             message = stream.next() => {
@@ -120,6 +140,21 @@ async fn run(socket: WebSocket, pane: std::sync::Arc<Pane>, client_id: u64) {
     );
 }
 
+async fn resync(
+    sink: &mut SplitSink<WebSocket, Message>,
+    pane: &Pane,
+    sent_seq: &mut u64,
+    screen_size: &mut (u16, u16),
+) -> bool {
+    let snapshot = pane.snapshot();
+    if send_full(sink, &snapshot).await.is_err() {
+        return false;
+    }
+    *sent_seq = snapshot.seq;
+    *screen_size = (snapshot.rows, snapshot.cols);
+    true
+}
+
 fn handle_client_frame(pane: &Pane, client_id: u64, data: Bytes) {
     let Some((&opcode, rest)) = data.split_first() else {
         return;
@@ -137,6 +172,16 @@ fn handle_client_frame(pane: &Pane, client_id: u64, data: Bytes) {
         }
         _ => {}
     }
+}
+
+async fn send_data(
+    sink: &mut SplitSink<WebSocket, Message>,
+    chunk: &OutputChunk,
+) -> Result<(), axum::Error> {
+    let mut payload = Vec::with_capacity(1 + chunk.data.len());
+    payload.push(SERVER_DATA);
+    payload.extend_from_slice(&chunk.data);
+    sink.send(Message::Binary(Bytes::from(payload))).await
 }
 
 async fn send_clipboard(

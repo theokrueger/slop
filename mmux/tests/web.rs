@@ -49,12 +49,12 @@ impl TestApp {
         config.workspace.root = root.path().to_path_buf();
         config.terminal.rows = 24;
         config.terminal.cols = 80;
-        config.new_tab.panes = template;
+        config.new_project.panes = template;
         config.validate().unwrap();
         let config = Arc::new(config);
 
         let sessions = Arc::new(SessionStore::new(
-            config.new_tab.panes.clone(),
+            config.new_project.panes.clone(),
             (config.terminal.rows, config.terminal.cols),
         ));
         let workspace = Arc::new(Workspace::new(root.path()).unwrap());
@@ -219,7 +219,7 @@ async fn login_sets_an_http_only_strict_session_cookie() {
     let cookie = cookie.split(';').next().unwrap();
     let state = app.state(cookie).await;
     assert_eq!(state["user"], USER);
-    assert_eq!(state["tabs"].as_array().unwrap().len(), 0);
+    assert_eq!(state["projects"].as_array().unwrap().len(), 0);
     assert_eq!(
         state["workspace_root"],
         app.root.path().to_string_lossy().as_ref()
@@ -236,7 +236,7 @@ async fn login_sets_an_http_only_strict_session_cookie() {
         .await;
     assert_eq!(status, StatusCode::OK);
     let index_html = String::from_utf8_lossy(&body);
-    assert!(index_html.contains("new tab"));
+    assert!(index_html.contains("new project"));
     // Relative asset URLs keep the app working behind a path prefix.
     assert!(index_html.contains(r#"src="assets/app.js""#));
     assert!(!index_html.contains(r#"src="/assets/"#));
@@ -274,7 +274,7 @@ async fn bad_credentials_and_missing_csrf_header_are_rejected() {
     let (status, _, _) = app
         .call(json_request(
             Method::POST,
-            "/api/tabs",
+            "/api/projects",
             json!({ "cwd": app.root.path().join("alpha") }),
             &[(header::COOKIE.as_str(), &cookie)],
             false,
@@ -349,7 +349,7 @@ async fn directory_listing_is_interactive_and_confined_to_the_root() {
 }
 
 #[tokio::test]
-async fn tabs_are_created_in_the_chosen_directory_and_can_be_renamed_and_closed() {
+async fn projects_are_created_in_the_chosen_directory_and_can_be_renamed_and_closed() {
     let app = TestApp::new(TestApp::default_template());
     let cookie = app.login().await;
     let alpha = app.root.path().join("alpha");
@@ -358,7 +358,7 @@ async fn tabs_are_created_in_the_chosen_directory_and_can_be_renamed_and_closed(
     let (status, _, body) = app
         .call(json_request(
             Method::POST,
-            "/api/tabs",
+            "/api/projects",
             json!({ "name": "agents", "cwd": alpha }),
             &[(header::COOKIE.as_str(), &cookie)],
             true,
@@ -370,35 +370,38 @@ async fn tabs_are_created_in_the_chosen_directory_and_can_be_renamed_and_closed(
         "{}",
         String::from_utf8_lossy(&body)
     );
-    let tab: Value = serde_json::from_slice(&body).unwrap();
-    let tab_id = tab["id"].as_u64().unwrap();
-    assert_eq!(tab["name"], "agents");
-    assert_eq!(tab["cwd"], alpha.to_string_lossy().as_ref());
-    assert_eq!(tab["panes"].as_array().unwrap().len(), 1);
-    assert_eq!(tab["panes"][0]["slot"], "top-left");
-    assert_eq!(tab["panes"][0]["status"]["state"], "running");
+    let project: Value = serde_json::from_slice(&body).unwrap();
+    let project_id = project["id"].as_u64().unwrap();
+    assert_eq!(project["name"], "agents");
+    assert_eq!(project["cwd"], alpha.to_string_lossy().as_ref());
+    assert_eq!(project["panes"].as_array().unwrap().len(), 1);
+    assert_eq!(project["panes"][0]["slot"], "top-left");
+    assert_eq!(project["panes"][0]["status"]["state"], "running");
 
     let state = app.state(&cookie).await;
-    assert_eq!(state["tabs"][0]["name"], "agents");
-    assert_eq!(state["tabs"][0]["cwd"], alpha.to_string_lossy().as_ref());
+    assert_eq!(state["projects"][0]["name"], "agents");
+    assert_eq!(
+        state["projects"][0]["cwd"],
+        alpha.to_string_lossy().as_ref()
+    );
 
     let (status, _, _) = app
         .call(json_request(
             Method::PATCH,
-            &format!("/api/tabs/{tab_id}"),
+            &format!("/api/projects/{project_id}"),
             json!({ "name": "renamed" }),
             &[(header::COOKIE.as_str(), &cookie)],
             true,
         ))
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(app.state(&cookie).await["tabs"][0]["name"], "renamed");
+    assert_eq!(app.state(&cookie).await["projects"][0]["name"], "renamed");
 
     let (status, _, _) = app
         .call(
             Request::builder()
                 .method(Method::DELETE)
-                .uri(format!("/api/tabs/{tab_id}"))
+                .uri(format!("/api/projects/{project_id}"))
                 .header(header::COOKIE, &cookie)
                 .header("x-mmux", "1")
                 .body(Body::empty())
@@ -407,14 +410,17 @@ async fn tabs_are_created_in_the_chosen_directory_and_can_be_renamed_and_closed(
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(
-        app.state(&cookie).await["tabs"].as_array().unwrap().len(),
+        app.state(&cookie).await["projects"]
+            .as_array()
+            .unwrap()
+            .len(),
         0
     );
 
     let (status, _, _) = app
         .call(json_request(
             Method::POST,
-            "/api/tabs",
+            "/api/projects",
             json!({ "cwd": unknown }),
             &[(header::COOKIE.as_str(), &cookie)],
             true,
@@ -437,15 +443,15 @@ async fn websocket_attaches_to_shared_terminal_state() {
     let (status, _, body) = app
         .call(json_request(
             Method::POST,
-            "/api/tabs",
+            "/api/projects",
             json!({ "cwd": app.root.path().join("alpha") }),
             &[(header::COOKIE.as_str(), &cookie)],
             true,
         ))
         .await;
     assert_eq!(status, StatusCode::CREATED);
-    let tab: Value = serde_json::from_slice(&body).unwrap();
-    let pane_id = tab["panes"][0]["id"].as_u64().unwrap();
+    let project: Value = serde_json::from_slice(&body).unwrap();
+    let pane_id = project["panes"][0]["id"].as_u64().unwrap();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -516,7 +522,7 @@ async fn websocket_attaches_to_shared_terminal_state() {
         if frame.is_empty() {
             continue;
         }
-        if frame[0] == 1 {
+        if frame[0] == 3 || frame[0] == 1 {
             transcript.push_str(&String::from_utf8_lossy(&frame[1..]));
         } else if frame[0] == 0 && frame.len() >= 5 {
             transcript.push_str(&String::from_utf8_lossy(&frame[5..]));
@@ -558,7 +564,7 @@ async fn websocket_attaches_to_shared_terminal_state() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     let state = app.state(&cookie).await;
     assert_eq!(
-        state["tabs"][0]["panes"][0]["status"]["state"], "running",
+        state["projects"][0]["panes"][0]["status"]["state"], "running",
         "closing a browser socket must not stop the pane"
     );
     server.abort();

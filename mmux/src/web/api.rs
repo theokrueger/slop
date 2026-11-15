@@ -13,21 +13,21 @@ use tokio_stream::wrappers::BroadcastStream;
 use tower_sessions::Session;
 
 use super::{AppState, AuthUser, MMUX_HEADER, SESSION_USER};
-use crate::session::{SessionError, SessionEvent, TabId, TabView};
+use crate::session::{ProjectId, ProjectView, SessionError, SessionEvent};
 use crate::workspace::WorkspaceError;
 
 #[derive(Debug, Serialize)]
 pub struct SessionView {
     pub user: String,
     pub workspace_root: String,
-    pub tabs: Vec<TabView>,
+    pub projects: Vec<ProjectView>,
 }
 
 pub async fn state(State(state): State<AppState>, AuthUser(user): AuthUser) -> Json<SessionView> {
     Json(SessionView {
         user,
         workspace_root: state.workspace.root().to_string_lossy().into_owned(),
-        tabs: state.sessions.snapshot().await,
+        projects: state.sessions.snapshot().await,
     })
 }
 
@@ -40,10 +40,10 @@ pub async fn events(
             Ok(event) => event,
             // A slow client missed events. Send a generic change event so it
             // re-fetches the authoritative snapshot.
-            Err(_lagged) => SessionEvent::TabsChanged,
+            Err(_lagged) => SessionEvent::ProjectsChanged,
         };
         let data = serde_json::to_string(&event)
-            .unwrap_or_else(|_| r#"{"type":"tabs_changed"}"#.to_owned());
+            .unwrap_or_else(|_| r#"{"type":"projects_changed"}"#.to_owned());
         Ok(Event::default().data(data))
     });
     Sse::new(stream).keep_alive(
@@ -109,19 +109,19 @@ pub async fn list_directory(
 }
 
 #[derive(Debug, Deserialize)]
-pub struct CreateTabRequest {
+pub struct CreateProjectRequest {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
 }
 
-pub async fn create_tab(
+pub async fn create_project(
     State(state): State<AppState>,
     AuthUser(_user): AuthUser,
     headers: HeaderMap,
-    Json(request): Json<CreateTabRequest>,
-) -> Result<(StatusCode, Json<TabView>), ApiError> {
+    Json(request): Json<CreateProjectRequest>,
+) -> Result<(StatusCode, Json<ProjectView>), ApiError> {
     require_mutation(&headers)?;
     if request
         .cwd
@@ -142,47 +142,47 @@ pub async fn create_tab(
         .map_err(ApiError::from_join)?
         .map_err(ApiError::from)?;
 
-    let tab = state
+    let project = state
         .sessions
-        .create_tab(request.name, cwd)
+        .create_project(request.name, cwd)
         .await
         .map_err(ApiError::from)?;
-    Ok((StatusCode::CREATED, Json(tab)))
+    Ok((StatusCode::CREATED, Json(project)))
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RenameTabRequest {
+pub struct RenameProjectRequest {
     pub name: String,
 }
 
-pub async fn rename_tab(
+pub async fn rename_project(
     State(state): State<AppState>,
     AuthUser(_user): AuthUser,
     headers: HeaderMap,
     Path(id): Path<u64>,
-    Json(request): Json<RenameTabRequest>,
+    Json(request): Json<RenameProjectRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_mutation(&headers)?;
     let found = state
         .sessions
-        .rename_tab(TabId::new(id), &request.name)
+        .rename_project(ProjectId::new(id), &request.name)
         .await
         .map_err(ApiError::from)?;
     if !found {
-        return Err(ApiError::not_found("no such tab"));
+        return Err(ApiError::not_found("no such project"));
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-pub async fn close_tab(
+pub async fn close_project(
     State(state): State<AppState>,
     AuthUser(_user): AuthUser,
     headers: HeaderMap,
     Path(id): Path<u64>,
 ) -> Result<StatusCode, ApiError> {
     require_mutation(&headers)?;
-    if !state.sessions.close_tab(TabId::new(id)).await {
-        return Err(ApiError::not_found("no such tab"));
+    if !state.sessions.close_project(ProjectId::new(id)).await {
+        return Err(ApiError::not_found("no such project"));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -274,7 +274,10 @@ impl From<SessionError> for ApiError {
             SessionError::InvalidName(message) => Self::bad_request(message),
             SessionError::Other(err) => {
                 tracing::warn!(error = %err, "session operation failed");
-                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "could not create tab")
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not create project",
+                )
             }
         }
     }

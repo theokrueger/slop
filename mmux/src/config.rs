@@ -21,7 +21,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub workspace: WorkspaceConfig,
     pub terminal: TerminalConfig,
-    pub new_tab: NewTabConfig,
+    pub new_project: NewProjectConfig,
 }
 
 impl Config {
@@ -74,27 +74,27 @@ impl Config {
         if self.workspace.root.as_os_str().is_empty() {
             return Err("workspace.root must not be empty".into());
         }
-        if self.new_tab.panes.is_empty() {
-            return Err("new_tab.panes must contain at least one pane".into());
+        if self.new_project.panes.is_empty() {
+            return Err("new_project.panes must contain at least one pane".into());
         }
 
         let mut slots = std::collections::HashSet::new();
-        for (index, pane) in self.new_tab.panes.iter().enumerate() {
+        for (index, pane) in self.new_project.panes.iter().enumerate() {
             if !slots.insert(pane.slot) {
                 return Err(format!(
-                    "new_tab.panes[{index}] uses slot `{}` more than once",
+                    "new_project.panes[{index}] uses slot `{}` more than once",
                     pane.slot
                 ));
             }
             if let Some(program) = pane.command.first() {
                 if program.is_empty() {
                     return Err(format!(
-                        "new_tab.panes[{index}].command must not start with an empty string"
+                        "new_project.panes[{index}].command must not start with an empty string"
                     ));
                 }
                 if pane.command.iter().any(|arg| arg.contains('\0')) {
                     return Err(format!(
-                        "new_tab.panes[{index}].command contains a NUL byte"
+                        "new_project.panes[{index}].command contains a NUL byte"
                     ));
                 }
             }
@@ -104,7 +104,7 @@ impl Config {
                 .any(|key| key.is_empty() || key.contains('='))
             {
                 return Err(format!(
-                    "new_tab.panes[{index}].env contains an invalid variable name"
+                    "new_project.panes[{index}].env contains an invalid variable name"
                 ));
             }
         }
@@ -112,7 +112,7 @@ impl Config {
     }
 }
 
-/// Validates a user-visible tab or pane label.
+/// Validates a user-visible project or pane label.
 pub fn validate_label(label: &str) -> Result<(), String> {
     let label = label.trim();
     if label.is_empty() {
@@ -200,12 +200,12 @@ impl Default for TerminalConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct NewTabConfig {
-    /// Panes started, in the selected working directory, for every new tab.
+pub struct NewProjectConfig {
+    /// Panes started, in the selected working directory, for every new project.
     pub panes: Vec<PaneConfig>,
 }
 
-impl Default for NewTabConfig {
+impl Default for NewProjectConfig {
     fn default() -> Self {
         Self {
             panes: default_panes(),
@@ -259,12 +259,12 @@ fn default_panes() -> Vec<PaneConfig> {
     vec![
         PaneConfig {
             slot: Slot::TopLeft,
-            command: vec!["pi".into()],
+            command: vec!["pi".into(), "--session-id".into(), "{session_id}".into()],
             env: BTreeMap::new(),
         },
         PaneConfig {
             slot: Slot::BottomLeft,
-            command: vec!["pi".into()],
+            command: vec!["pi".into(), "--session-id".into(), "{session_id}".into()],
             env: BTreeMap::new(),
         },
         PaneConfig {
@@ -291,8 +291,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_document_uses_defaults_except_required_new_tab() {
-        // `new_tab` has a serde default, so an empty document is valid.
+    fn empty_document_uses_defaults_except_required_new_project() {
+        // `new_project` has a serde default, so an empty document is valid.
         let parsed = Config::from_toml("").expect("empty config is valid");
         assert_eq!(parsed, Config::default());
     }
@@ -300,9 +300,9 @@ mod tests {
     #[test]
     fn rejects_duplicate_slots() {
         let text = r#"
-            [[new_tab.panes]]
+            [[new_project.panes]]
             slot = "top-left"
-            [[new_tab.panes]]
+            [[new_project.panes]]
             slot = "top-left"
         "#;
         let err = Config::from_toml(text).unwrap_err().to_string();
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn pane_names_are_no_longer_configurable() {
         let text = r#"
-            [[new_tab.panes]]
+            [[new_project.panes]]
             slot = "top-left"
             name = "legacy"
         "#;

@@ -29,23 +29,30 @@ root = "~"
 rows = 30
 cols = 100
 
-# Every new tab starts this set of panes, in the directory chosen in the
-# browser. Tabs are not created at startup; they are created on demand.
+# Every new project starts this set of panes, in the directory chosen in the
+# browser. Projects are created on demand and persisted under
+# $XDG_STATE_HOME/mmux/projects.json; on restart they are restored with fresh
+# panes in their saved working directories.
+#
+# `{session_id}` is replaced once per pane with a UUID when the project is
+# created, and the resolved command is saved with the project. The default pi
+# panes therefore resume their session after a restart. Commands without the
+# placeholder are left untouched.
 # An empty `command` starts the user's $SHELL. Four slots are available:
 # top-left, top-right, bottom-left, bottom-right. Omitted slots stay empty.
 
-[[new_tab.panes]]
+[[new_project.panes]]
 slot = "top-left"
-command = ["pi"]
+command = ["pi", "--session-id", "{session_id}"]
 
-[[new_tab.panes]]
+[[new_project.panes]]
 slot = "bottom-left"
-command = ["pi"]
+command = ["pi", "--session-id", "{session_id}"]
 
-[[new_tab.panes]]
+[[new_project.panes]]
 slot = "top-right"
 command = ["emacs", "-nw"]
 
-[[new_tab.panes]]
+[[new_project.panes]]
 slot = "bottom-right"
 command = []

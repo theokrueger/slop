@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use mmux::auth::{self, PamAuthenticator};
 use mmux::config::{Config, DEFAULT_CONFIG_TOML};
+use mmux::persistence;
 use mmux::session::SessionStore;
 use mmux::web::{self, AppState};
 use mmux::workspace::Workspace;
@@ -61,10 +62,25 @@ async fn run(config: Config) -> anyhow::Result<()> {
         PamAuthenticator::new(config.auth.pam_service.clone(), user.clone())
             .context("could not configure PAM")?,
     );
-    let sessions = Arc::new(SessionStore::new(
-        config.new_tab.panes.clone(),
-        (config.terminal.rows, config.terminal.cols),
-    ));
+    let state_path = persistence::default_state_path();
+    let sessions = Arc::new(match state_path.as_ref() {
+        Some(path) => SessionStore::with_state_file(
+            config.new_project.panes.clone(),
+            (config.terminal.rows, config.terminal.cols),
+            path.clone(),
+        ),
+        None => {
+            tracing::warn!("could not determine a state directory; projects will not persist");
+            SessionStore::new(
+                config.new_project.panes.clone(),
+                (config.terminal.rows, config.terminal.cols),
+            )
+        }
+    });
+    if let Some(path) = state_path.as_ref() {
+        tracing::info!(state = %path.display(), "project persistence enabled");
+    }
+    sessions.restore().await;
     let config = Arc::new(config);
     let bind = config.server.bind;
 
