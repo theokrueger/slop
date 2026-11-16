@@ -13,6 +13,7 @@ use tower::ServiceExt;
 
 use mmux::auth::{AuthError, Authenticator};
 use mmux::config::{Config, PaneConfig, Slot};
+use mmux::memory::{Memory, MemoryReadiness};
 use mmux::session::SessionStore;
 use mmux::web::{self, AppState};
 use mmux::workspace::Workspace;
@@ -35,7 +36,11 @@ impl Authenticator for MockAuth {
 struct TestApp {
     app: Router,
     sessions: Arc<SessionStore>,
+    /// Kept alive for the lifetime of the app: memory writes land here.
+    _memory: Option<Arc<Memory>>,
     root: TempDir,
+    /// Kept alive so the state directory (projects and memory) outlives the app.
+    _state: TempDir,
 }
 
 impl TestApp {
@@ -45,33 +50,43 @@ impl TestApp {
         std::fs::create_dir(root.path().join("beta")).unwrap();
         std::fs::create_dir(root.path().join("alpha/nested")).unwrap();
 
+        let state = TempDir::new().unwrap();
         let mut config = Config::default();
         config.workspace.root = root.path().to_path_buf();
         config.terminal.rows = 24;
         config.terminal.cols = 80;
         config.new_project.panes = template;
+        config.memory.dir = Some(state.path().join("memory"));
+        // Keep the readiness probe away from the real user config.
+        config.memory.pi_agent_dir = state.path().join("pi");
         config.validate().unwrap();
+        let memory = Memory::from_config(&config.memory, None).map(Arc::new);
         let config = Arc::new(config);
 
-        let sessions = Arc::new(SessionStore::new(
+        let sessions = Arc::new(SessionStore::with_state_dir(
             config.new_project.panes.clone(),
             (config.terminal.rows, config.terminal.cols),
+            state.path().to_path_buf(),
         ));
         let workspace = Arc::new(Workspace::new(root.path()).unwrap());
-        let state = AppState::new(
+        let app_state = AppState::new(
             config.clone(),
             sessions.clone(),
             workspace,
             Arc::new(MockAuth),
             USER.to_owned(),
+            memory.clone(),
+            MemoryReadiness::NotApplicable,
         );
         // Give each test its own session store and router so the login
         // governor is not shared between tests.
-        let app = web::router(state);
+        let app = web::router(app_state);
         Self {
             app,
             sessions,
+            _memory: memory,
             root,
+            _state: state,
         }
     }
 
@@ -674,4 +689,352 @@ async fn logout_invalidates_the_session_cookie() {
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     app.shutdown().await;
+}
+
+#[tokio::test]
+async fn memory_documents_round_trip_through_the_api() {
+    let app = TestApp::new(TestApp::default_template());
+    let cookie = app.login().await;
+    let workspace = app.root.path().to_string_lossy().into_owned();
+
+    let status = app
+        .call(
+            Request::builder()
+                .uri("/api/memory/status")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status.0, StatusCode::OK);
+    let view: Value = serde_json::from_slice(&status.2).unwrap();
+    assert_eq!(view["enabled"], true);
+    assert_eq!(view["state"], "not_applicable");
+
+    // A refresh re-runs the read-only probe without restarting mmux.
+    let (status, _, body) = app
+        .call(
+            Request::builder()
+                .uri("/api/memory/status?refresh=1")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let refreshed: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        matches!(
+            refreshed["state"].as_str(),
+            Some("missing") | Some("not_applicable")
+        ),
+        "{refreshed}"
+    );
+
+    // Creating a document requires the mutation header.
+    let (status, _, _) = app
+        .call(json_request(
+            Method::POST,
+            "/api/memory/docs",
+            json!({ "title": "Restart policy", "kind": "decision", "body": "panes relaunch", "tags": ["session"], "workspace": workspace }),
+            &[(header::COOKIE.as_str(), &cookie)],
+            false,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _, body) = app
+        .call(json_request(
+            Method::POST,
+            "/api/memory/docs",
+            json!({ "title": "Restart policy", "kind": "decision", "body": "panes relaunch", "tags": ["session"], "workspace": workspace }),
+            &[(header::COOKIE.as_str(), &cookie)],
+            true,
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let doc: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(doc["slug"], "restart-policy");
+    assert_eq!(doc["kind"], "decision");
+    assert_eq!(doc["author"], "user");
+    let hash = doc["hash"].as_str().unwrap().to_owned();
+
+    let (status, _, body) = app
+        .call(
+            Request::builder()
+                .uri(format!(
+                    "/api/memory/docs?workspace={}",
+                    urlencode(&workspace)
+                ))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let listing: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listing["docs"].as_array().unwrap().len(), 1);
+    assert_eq!(listing["docs"][0]["slug"], "restart-policy");
+    assert_eq!(listing["workspace"]["path"], workspace);
+
+    let uri = format!(
+        "/api/memory/docs/restart-policy?workspace={}",
+        urlencode(&workspace)
+    );
+    let (status, _, body) = app
+        .call(
+            Request::builder()
+                .uri(&uri)
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    // Optimistic update with the current hash succeeds.
+    let (status, _, body) = app
+        .call(json_request(
+            Method::PUT,
+            &uri,
+            json!({ "body": "panes relaunch with the same session id" }),
+            &[
+                (header::COOKIE.as_str(), &cookie),
+                (header::IF_MATCH.as_str(), &hash),
+            ],
+            true,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let updated: Value = serde_json::from_slice(&body).unwrap();
+    assert_ne!(updated["hash"], hash);
+
+    // A stale hash is a conflict.
+    let (status, _, _) = app
+        .call(json_request(
+            Method::PUT,
+            &uri,
+            json!({ "body": "another edit" }),
+            &[
+                (header::COOKIE.as_str(), &cookie),
+                (header::IF_MATCH.as_str(), &hash),
+            ],
+            true,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, _, body) = app
+        .call(
+            Request::builder()
+                .uri(format!(
+                    "/api/memory/search?q=session&workspace={}",
+                    urlencode(&workspace)
+                ))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let hits: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(hits["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(hits["hits"][0]["slug"], "restart-policy");
+
+    let (status, _, _) = app
+        .call(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(&uri)
+                .header(header::COOKIE, &cookie)
+                .header("x-mmux", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = app
+        .call(
+            Request::builder()
+                .uri(&uri)
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn closing_a_project_archives_it_and_it_can_be_restored_or_deleted() {
+    let app = TestApp::new(TestApp::default_template());
+    let cookie = app.login().await;
+    let alpha = app.root.path().join("alpha");
+
+    let (status, _, body) = app
+        .call(json_request(
+            Method::POST,
+            "/api/projects",
+            json!({ "name": "archived one", "cwd": alpha }),
+            &[(header::COOKIE.as_str(), &cookie)],
+            true,
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let project: Value = serde_json::from_slice(&body).unwrap();
+    let project_id = project["id"].as_u64().unwrap();
+
+    // Closing moves it to the archive instead of deleting it.
+    let (status, _, _) = app
+        .call(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/projects/{project_id}"))
+                .header(header::COOKIE, &cookie)
+                .header("x-mmux", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        app.state(&cookie).await["projects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    let (status, _, body) = app
+        .call(
+            Request::builder()
+                .uri("/api/archive")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let archive: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(archive["readable"], true);
+    let entries = archive["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "archived one");
+    assert_eq!(entries[0]["pane_count"], 1);
+    let archived_id = entries[0]["id"].as_str().unwrap().to_owned();
+
+    // Restoring brings the same project back.
+    let (status, _, body) = app
+        .call(json_request(
+            Method::POST,
+            &format!("/api/archive/{archived_id}/restore"),
+            json!({}),
+            &[(header::COOKIE.as_str(), &cookie)],
+            true,
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let restored: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(restored["name"], "archived one");
+    assert_eq!(
+        app.state(&cookie).await["projects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Archive it again, then delete it permanently.
+    let restored_id = restored["id"].as_u64().unwrap();
+    app.call(
+        Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/api/projects/{restored_id}"))
+            .header(header::COOKIE, &cookie)
+            .header("x-mmux", "1")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    // Server-generated permalink uses the durable UUID, not the runtime id.
+    let (_, _, body) = app
+        .call(
+            Request::builder()
+                .uri("/api/archive")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let archive: Value = serde_json::from_slice(&body).unwrap();
+    let archived_id = archive["entries"][0]["id"].as_str().unwrap().to_owned();
+
+    let (status, _, _) = app
+        .call(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/archive/{archived_id}"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _, _) = app
+        .call(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/archive/{archived_id}"))
+                .header(header::COOKIE, &cookie)
+                .header("x-mmux", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, _, body) = app
+        .call(
+            Request::builder()
+                .uri("/api/archive")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let archive: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(archive["entries"].as_array().unwrap().len(), 0);
+
+    app.shutdown().await;
+}
+
+fn urlencode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }

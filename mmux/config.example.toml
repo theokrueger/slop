@@ -37,6 +37,23 @@ appearance = "dark"
 # environment; `RUST_LOG` is only an override for one-off debugging.
 filter = "mmux=info,tower_http=warn"
 
+[memory]
+# Project memory: a plaintext vault of meta-docs (decisions, plans, runbooks).
+# Docs are written on demand by you or an agent; mmux never summarizes or
+# writes them on its own. Agents reach the vault through the `mmux mcp` MCP
+# server, which reads this same file.
+enabled = true
+# Vault root. Defaults to $XDG_STATE_HOME/mmux/memory.
+# dir = "~/.local/state/mmux/memory"
+# Largest document the CLI, UI, or MCP will write.
+max_doc_bytes = 65536
+# Previous revisions kept per document. 0 keeps no history.
+history_versions = 20
+# "explicit": agents may write when the user asks; "deny": MCP writes fail.
+agent_writes = "explicit"
+# pi's config directory. mmux reads it to check the MCP entry; it never writes.
+pi_agent_dir = "~/.pi/agent"
+
 # Every new project starts this set of panes, in the directory chosen in the
 # browser. Projects are created on demand and persisted in per-project
 # directories under $XDG_STATE_HOME/mmux/projects/; on restart they are

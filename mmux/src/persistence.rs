@@ -260,6 +260,352 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Project archive
+//
+// Closing a project moves its directory here instead of deleting it. The
+// directories are the truth; `archive/index.json` only records ordering, so a
+// lost or damaged index never loses a project.
+// ---------------------------------------------------------------------------
+
+const ARCHIVE_DIR: &str = "archive";
+const ARCHIVED_FILE: &str = "archived.json";
+const ARCHIVE_VERSION: u32 = 1;
+
+pub fn archive_dir(state_dir: &Path, id: Uuid) -> PathBuf {
+    state_dir.join(ARCHIVE_DIR).join(id.to_string())
+}
+
+/// Metadata stored beside an archived `project.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveMeta {
+    pub version: u32,
+    pub archived_at: String,
+    pub original_position: usize,
+    pub pane_count: usize,
+}
+
+/// A closed project, as listed by the archive API.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchivedProject {
+    pub id: Uuid,
+    pub name: String,
+    pub cwd: String,
+    #[serde(skip)]
+    pub panes: Vec<PaneConfig>,
+    pub archived_at: String,
+    pub original_position: usize,
+    pub pane_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ArchiveIndex {
+    version: u32,
+    projects: Vec<Uuid>,
+}
+
+/// Moves a project directory to the archive. The caller must have already saved
+/// a live index that no longer references the project.
+pub fn archive(state_dir: &Path, project: &ProjectRecord, original_position: usize) -> Result<()> {
+    let source = project_dir(state_dir, project.id);
+    if !source.join(PROJECT_FILE).is_file() {
+        bail!("no persisted project {}", project.id);
+    }
+    let root = state_dir.join(ARCHIVE_DIR);
+    create_private_dir(&root)?;
+    let target = archive_dir(state_dir, project.id);
+    if target.exists() {
+        bail!("project {} is already archived", project.id);
+    }
+
+    move_dir(&source, &target)?;
+    let meta = ArchiveMeta {
+        version: ARCHIVE_VERSION,
+        archived_at: now_rfc3339(),
+        original_position,
+        pane_count: project.panes.len(),
+    };
+    write_atomic(
+        &target.join(ARCHIVED_FILE),
+        &serde_json::to_vec_pretty(&meta)?,
+    )?;
+    // The index is an ordering hint only; a failure here must not undo a
+    // successful move.
+    if let Err(err) = add_to_archive_index(state_dir, project.id) {
+        tracing::warn!(error = %err, "could not update the archive index");
+    }
+    Ok(())
+}
+
+/// Reads every archived project. Unreadable entries are skipped with a warning
+/// so one damaged directory cannot hide the rest.
+pub fn load_archive(state_dir: &Path) -> Result<Vec<ArchivedProject>> {
+    let root = state_dir.join(ARCHIVE_DIR);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", root.display())),
+    };
+    let order = read_archive_index(state_dir).unwrap_or_default();
+    let mut archived = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Ok(id) = Uuid::parse_str(name) else {
+            continue;
+        };
+        let file = path.join(PROJECT_FILE);
+        let bytes = match fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                tracing::warn!(path = %file.display(), error = %err, "could not read archived project");
+                continue;
+            }
+        };
+        let parsed: ProjectFile = match serde_json::from_slice(&bytes) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                tracing::warn!(path = %file.display(), error = %err, "skipping unreadable archived project");
+                continue;
+            }
+        };
+        if parsed.project.id != id {
+            tracing::warn!(path = %file.display(), "archived project id does not match directory");
+            continue;
+        }
+        let meta: ArchiveMeta = fs::read(path.join(ARCHIVED_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(|| ArchiveMeta {
+                version: ARCHIVE_VERSION,
+                archived_at: String::new(),
+                original_position: 0,
+                pane_count: parsed.project.panes.len(),
+            });
+        archived.push(ArchivedProject {
+            id,
+            name: parsed.project.name,
+            cwd: parsed.project.cwd,
+            panes: parsed.project.panes,
+            archived_at: meta.archived_at,
+            original_position: meta.original_position,
+            pane_count: meta.pane_count,
+        });
+    }
+
+    archived.sort_by(|left, right| {
+        let left_order = order.iter().position(|id| *id == left.id);
+        let right_order = order.iter().position(|id| *id == right.id);
+        left_order
+            .unwrap_or(usize::MAX)
+            .cmp(&right_order.unwrap_or(usize::MAX))
+            .then_with(|| right.archived_at.cmp(&left.archived_at))
+    });
+    Ok(archived)
+}
+
+/// Moves an archived project back and returns its record.
+pub fn restore_archived(state_dir: &Path, id: Uuid) -> Result<ProjectRecord> {
+    let source = archive_dir(state_dir, id);
+    if !source.join(PROJECT_FILE).is_file() {
+        bail!("no archived project {id}");
+    }
+    let target = project_dir(state_dir, id);
+    if target.exists() {
+        bail!("project {id} is already open");
+    }
+
+    move_dir(&source, &target)?;
+    let _ = fs::remove_file(target.join(ARCHIVED_FILE));
+    if let Err(err) = remove_from_archive_index(state_dir, id) {
+        tracing::warn!(error = %err, "could not update the archive index");
+    }
+
+    let bytes = fs::read(target.join(PROJECT_FILE))?;
+    let file: ProjectFile = serde_json::from_slice(&bytes)?;
+    if file.project.id != id {
+        bail!("archived project id does not match its directory");
+    }
+    Ok(file.project)
+}
+
+/// Permanently removes an archived project. Never touches memory: that is keyed
+/// by workspace path and may be shared with other projects.
+pub fn delete_archived(state_dir: &Path, id: Uuid) -> Result<()> {
+    let dir = archive_dir(state_dir, id);
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!("no archived project {id}");
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("removing {}", dir.display()));
+        }
+    }
+    if let Err(err) = remove_from_archive_index(state_dir, id) {
+        tracing::warn!(error = %err, "could not update the archive index");
+    }
+    Ok(())
+}
+
+fn read_archive_index(state_dir: &Path) -> Result<Vec<Uuid>> {
+    let path = state_dir.join(ARCHIVE_DIR).join(INDEX_FILE);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let index: ArchiveIndex = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            Ok(index.projects)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn write_archive_index(state_dir: &Path, ids: &[Uuid]) -> Result<()> {
+    let root = state_dir.join(ARCHIVE_DIR);
+    create_private_dir(&root)?;
+    let index = ArchiveIndex {
+        version: ARCHIVE_VERSION,
+        projects: ids.to_vec(),
+    };
+    write_atomic(&root.join(INDEX_FILE), &serde_json::to_vec_pretty(&index)?)
+}
+
+fn add_to_archive_index(state_dir: &Path, id: Uuid) -> Result<()> {
+    let mut ids = read_archive_index(state_dir).unwrap_or_default();
+    ids.retain(|existing| *existing != id);
+    ids.insert(0, id);
+    write_archive_index(state_dir, &ids)
+}
+
+fn remove_from_archive_index(state_dir: &Path, id: Uuid) -> Result<()> {
+    let mut ids = read_archive_index(state_dir)?;
+    ids.retain(|existing| *existing != id);
+    write_archive_index(state_dir, &ids)
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+/// `rename` is atomic on one filesystem; fall back to copy-and-remove across
+/// devices so a state directory on a different mount still works.
+fn move_dir(source: &Path, target: &Path) -> Result<()> {
+    if fs::rename(source, target).is_ok() {
+        return Ok(());
+    }
+    copy_dir(source, target)?;
+    fs::remove_dir_all(source).with_context(|| format!("removing {}", source.display()))
+}
+
+fn copy_dir(source: &Path, target: &Path) -> Result<()> {
+    create_private_dir(target)?;
+    for entry in fs::read_dir(source).with_context(|| format!("reading {}", source.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let destination = target.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir(&path, &destination)?;
+        } else {
+            fs::copy(&path, &destination).with_context(|| format!("copying {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use crate::config::Slot;
+    use tempfile::TempDir;
+
+    fn record(name: &str, cwd: &Path) -> ProjectRecord {
+        ProjectRecord {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            panes: vec![PaneConfig {
+                slot: Slot::TopLeft,
+                command: vec!["sh".into()],
+                env: Default::default(),
+            }],
+        }
+    }
+
+    #[test]
+    fn archive_moves_the_directory_and_restore_brings_it_back() {
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        let project = record("api", &dir.path().join("workspace"));
+        save(&state, std::slice::from_ref(&project)).unwrap();
+
+        archive(&state, &project, 0).unwrap();
+        assert!(!project_dir(&state, project.id).exists());
+        let archived = load_archive(&state).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, project.id);
+        assert_eq!(archived[0].pane_count, 1);
+        assert!(!archived[0].archived_at.is_empty());
+
+        // Archiving twice is refused rather than overwriting.
+        assert!(archive(&state, &project, 0).is_err());
+
+        let restored = restore_archived(&state, project.id).unwrap();
+        assert_eq!(restored.name, "api");
+        assert!(project_dir(&state, project.id).exists());
+        assert!(load_archive(&state).unwrap().is_empty());
+
+        // Restoring twice is refused.
+        assert!(restore_archived(&state, project.id).is_err());
+    }
+
+    #[test]
+    fn delete_removes_only_the_archive_directory() {
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        let project = record("api", &dir.path().join("workspace"));
+        save(&state, std::slice::from_ref(&project)).unwrap();
+        archive(&state, &project, 0).unwrap();
+
+        delete_archived(&state, project.id).unwrap();
+        assert!(!archive_dir(&state, project.id).exists());
+        assert!(load_archive(&state).unwrap().is_empty());
+        assert!(delete_archived(&state, project.id).is_err());
+    }
+
+    #[test]
+    fn a_lost_index_does_not_lose_projects() {
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        let project = record("api", &dir.path().join("workspace"));
+        save(&state, std::slice::from_ref(&project)).unwrap();
+        archive(&state, &project, 0).unwrap();
+
+        fs::remove_file(state.join(ARCHIVE_DIR).join(INDEX_FILE)).unwrap();
+        let archived = load_archive(&state).unwrap();
+        assert_eq!(archived.len(), 1);
+        // Restore still works without the index.
+        assert!(restore_archived(&state, project.id).is_ok());
+    }
+
+    #[test]
+    fn archiving_an_unknown_project_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("state");
+        let project = record("api", &dir.path().join("workspace"));
+        assert!(archive(&state, &project, 0).is_err());
+        assert!(restore_archived(&state, project.id).is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

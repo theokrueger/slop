@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod memory;
 pub mod persistence;
 pub mod session;
 pub mod theme;

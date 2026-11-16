@@ -28,6 +28,7 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     pub terminal: TerminalConfig,
     pub logging: LoggingConfig,
+    pub memory: MemoryConfig,
     pub new_project: NewProjectConfig,
 }
 
@@ -80,6 +81,7 @@ impl Config {
         if self.logging.filter.trim().is_empty() {
             return Err("logging.filter must not be empty".into());
         }
+        self.memory.validate()?;
         if self.workspace.root.as_os_str().is_empty() {
             return Err("workspace.root must not be empty".into());
         }
@@ -205,6 +207,72 @@ impl Default for LoggingConfig {
             filter: DEFAULT_LOG_FILTER.to_owned(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Master switch for the document vault, the MCP server, and history
+    /// capture. `false` leaves every pane and every other feature untouched.
+    pub enabled: bool,
+    /// Vault root. `None` uses `$XDG_STATE_HOME/mmux/memory`.
+    pub dir: Option<PathBuf>,
+    /// Largest document the CLI, UI, or MCP will write.
+    pub max_doc_bytes: usize,
+    /// Previous revisions kept per document. `0` keeps no history.
+    pub history_versions: usize,
+    /// Whether agents may write. `explicit` allows writes when the user asks;
+    /// `deny` rejects every MCP write.
+    pub agent_writes: AgentWrites,
+    /// pi's configuration directory. Read-only: mmux never writes here; it is
+    /// only used to probe whether the MCP entry is present.
+    pub pi_agent_dir: PathBuf,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: None,
+            max_doc_bytes: 65_536,
+            history_versions: 20,
+            agent_writes: AgentWrites::Explicit,
+            pi_agent_dir: PathBuf::from("~/.pi/agent"),
+        }
+    }
+}
+
+impl MemoryConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !(1024..=4 * 1024 * 1024).contains(&self.max_doc_bytes) {
+            return Err("memory.max_doc_bytes must be between 1024 and 4194304".into());
+        }
+        if self.history_versions > 100 {
+            return Err("memory.history_versions must be at most 100".into());
+        }
+        if self.pi_agent_dir.as_os_str().is_empty() {
+            return Err("memory.pi_agent_dir must not be empty".into());
+        }
+        if self
+            .dir
+            .as_ref()
+            .is_some_and(|dir| dir.as_os_str().is_empty())
+        {
+            return Err("memory.dir must not be empty when set".into());
+        }
+        Ok(())
+    }
+}
+
+/// Who may write memory documents over MCP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentWrites {
+    /// Writes are allowed; the tool description asks the agent to use them
+    /// only when the user asks.
+    Explicit,
+    /// Every agent-originated write is rejected with an error.
+    Deny,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

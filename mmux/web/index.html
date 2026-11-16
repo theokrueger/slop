@@ -11,19 +11,41 @@
   <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
-  <div id="loading" class="loading">loading mmux…</div>
+  <div id="loading" class="loading">loading mmux...</div>
 
   <div id="app" class="app" hidden>
     <aside class="sidebar">
-      <nav id="projects" class="projects" aria-label="Projects"></nav>
+      <nav id="projects" class="projects" aria-label="projects"></nav>
 
-      <button id="new-project" class="new-project" type="button">+ new project</button>
+      <div class="sidebar-actions">
+        <button id="new-project" class="new-project" type="button">+ new project</button>
+        <button id="archive-toggle" class="archive-toggle" type="button" aria-label="archived projects" title="archived projects">[a]</button>
+      </div>
 
-      <section id="project-management" class="project-management" aria-label="Project management" hidden>
-        <dl class="project-details">
-          <dt>Working directory</dt>
-          <dd id="project-cwd" class="project-cwd"></dd>
-        </dl>
+      <section id="project-management" class="project-management" aria-label="project management" hidden>
+        <p id="project-cwd" class="project-cwd"></p>
+
+        <section class="project-memory" aria-label="project memory">
+          <div class="project-memory-head">
+            <h2 class="project-memory-title">memory</h2>
+            <button id="memory-new" class="button memory-new" type="button">new</button>
+          </div>
+
+          <div id="memory-status" class="memory-status" hidden>
+            <p id="memory-status-message" class="memory-status-message"></p>
+            <pre id="memory-status-advice" class="memory-status-advice" hidden></pre>
+            <button id="memory-status-recheck" class="button memory-status-recheck" type="button">re-check</button>
+          </div>
+
+          <div class="memory-search-row">
+            <input id="memory-search" class="memory-search" type="search" placeholder="search memory..." autocomplete="off" spellcheck="false" aria-label="search memory">
+          </div>
+
+          <p id="memory-list-error" class="error" hidden></p>
+
+          <ul id="memory-list" class="memory-list" aria-label="memory docs"></ul>
+
+        </section>
       </section>
 
       <div class="sidebar-footer">
@@ -37,35 +59,101 @@
       <div id="empty-state" class="empty-state" hidden>
         <p class="empty-title">No projects open</p>
         <p class="empty-hint">Open a project in the directory you want to work in.</p>
-        <button id="empty-new-project" type="button">New project</button>
+        <button id="empty-new-project" type="button">new project</button>
       </div>
     </main>
   </div>
 
   <dialog id="new-project-dialog" class="dialog">
     <form id="new-project-form" method="dialog">
-      <h2>New project</h2>
+      <h2>new project</h2>
 
       <label class="field">
-        <span>Name</span>
+        <span>name</span>
         <input id="new-project-name" type="text" maxlength="80" autocomplete="off" spellcheck="false">
       </label>
 
       <label class="field">
-        <span>Working directory</span>
+        <span>working directory</span>
         <input id="dir-path" type="text" autocomplete="off" spellcheck="false">
       </label>
 
       <div id="dir-current" class="dir-current"></div>
-      <ul id="dir-list" class="dir-list" aria-label="Directories"></ul>
+      <ul id="dir-list" class="dir-list" aria-label="directories"></ul>
 
       <p id="dialog-error" class="error" hidden></p>
 
       <div class="dialog-actions">
-        <button id="dialog-cancel" class="button" type="button">Cancel</button>
-        <button id="dialog-create" class="button primary" type="submit">Create project</button>
+        <button id="dialog-cancel" class="button" type="button">cancel</button>
+        <button id="dialog-create" class="button primary" type="submit">create project</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="memory-dialog" class="dialog memory-dialog">
+    <div class="dialog-body memory-panel">
+      <h2 id="memory-dialog-title">new doc</h2>
+
+      <section id="memory-editor" class="memory-editor" aria-label="memory editor">
+        <div class="memory-fields">
+          <label class="field">
+            <span>title</span>
+            <input id="memory-title" type="text" maxlength="200" autocomplete="off" spellcheck="false">
+          </label>
+
+          <label class="field">
+            <span>kind</span>
+            <select id="memory-kind">
+              <option value="note">note</option>
+              <option value="decision">decision</option>
+              <option value="plan">plan</option>
+              <option value="runbook">runbook</option>
+              <option value="retro">retro</option>
+              <option value="reference">reference</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>tags</span>
+            <input id="memory-tags" type="text" placeholder="comma separated" autocomplete="off" spellcheck="false">
+          </label>
+        </div>
+
+        <label class="field">
+          <span>body</span>
+          <textarea id="memory-body" class="memory-body-input" spellcheck="false"></textarea>
+        </label>
+
+        <p id="memory-editor-error" class="error" hidden></p>
+
+        <div class="memory-editor-actions">
+          <button id="memory-delete" class="button danger" type="button" hidden>delete</button>
+          <button id="memory-reload" class="button" type="button" hidden>reload</button>
+          <button id="memory-cancel" class="button" type="button">cancel</button>
+          <button id="memory-save" class="button primary" type="button">save</button>
+        </div>
+      </section>
+
+      <div class="dialog-actions">
+        <button id="memory-close" class="button" type="button">close</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="archive-dialog" class="dialog archive-dialog">
+    <div class="dialog-body archive-panel">
+      <h2>archived projects</h2>
+
+      <p id="archive-error" class="error" hidden></p>
+      <button id="archive-retry" class="button archive-retry" type="button" hidden>retry</button>
+      <p id="archive-empty" class="archive-empty" hidden>no archived projects</p>
+
+      <ul id="archive-list" class="archive-list" aria-label="archived projects"></ul>
+
+      <div class="dialog-actions">
+        <button id="archive-close" class="button" type="button">close</button>
+      </div>
+    </div>
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

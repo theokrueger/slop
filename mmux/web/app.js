@@ -26,6 +26,7 @@
     ArrowLeft: "left",
     ArrowRight: "right",
   };
+  const MEMORY_KINDS = ["note", "decision", "plan", "runbook", "retro", "reference"];
 
   const els = {
     loading: document.getElementById("loading"),
@@ -34,6 +35,34 @@
     projectManagement: document.getElementById("project-management"),
     projectCwd: document.getElementById("project-cwd"),
     newProject: document.getElementById("new-project"),
+    archiveToggle: document.getElementById("archive-toggle"),
+    memoryDialog: document.getElementById("memory-dialog"),
+    memoryDialogTitle: document.getElementById("memory-dialog-title"),
+    memoryStatus: document.getElementById("memory-status"),
+    memoryStatusMessage: document.getElementById("memory-status-message"),
+    memoryStatusAdvice: document.getElementById("memory-status-advice"),
+    memoryStatusRecheck: document.getElementById("memory-status-recheck"),
+    memorySearch: document.getElementById("memory-search"),
+    memoryNew: document.getElementById("memory-new"),
+    memoryList: document.getElementById("memory-list"),
+    memoryListError: document.getElementById("memory-list-error"),
+    memoryEditor: document.getElementById("memory-editor"),
+    memoryTitle: document.getElementById("memory-title"),
+    memoryKind: document.getElementById("memory-kind"),
+    memoryTags: document.getElementById("memory-tags"),
+    memoryBody: document.getElementById("memory-body"),
+    memoryEditorError: document.getElementById("memory-editor-error"),
+    memorySave: document.getElementById("memory-save"),
+    memoryDelete: document.getElementById("memory-delete"),
+    memoryReload: document.getElementById("memory-reload"),
+    memoryCancel: document.getElementById("memory-cancel"),
+    memoryClose: document.getElementById("memory-close"),
+    archiveDialog: document.getElementById("archive-dialog"),
+    archiveError: document.getElementById("archive-error"),
+    archiveRetry: document.getElementById("archive-retry"),
+    archiveEmpty: document.getElementById("archive-empty"),
+    archiveList: document.getElementById("archive-list"),
+    archiveClose: document.getElementById("archive-close"),
     user: document.getElementById("user"),
     logout: document.getElementById("logout"),
     main: document.getElementById("main"),
@@ -69,14 +98,31 @@
     events: null,
     pickerRequest: 0,
     pickerLoading: false,
+    memory: {
+      status: null,
+      docs: [],
+      hits: [],
+      query: "",
+      searchToken: 0,
+      searchTimer: 0,
+      editingDoc: null,
+      editingWorkspace: null,
+      loadedFor: null,
+    },
+    archive: {
+      data: null,
+      error: null,
+      count: 0,
+    },
   };
 
   const encoder = new TextEncoder();
 
-  async function api(path, { method = "GET", body, mutation = false } = {}) {
+  async function api(path, { method = "GET", body, mutation = false, headers: extraHeaders } = {}) {
     const headers = {};
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (mutation) headers["X-MMUX"] = "1";
+    if (extraHeaders) Object.assign(headers, extraHeaders);
     const response = await fetch(path, {
       method,
       headers,
@@ -99,7 +145,9 @@
     if (!response.ok) {
       let message = data && data.error ? data.error : `request failed (${response.status})`;
       if (response.status === 429) message = "Too many attempts. Try again in a few seconds.";
-      throw new Error(message);
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
     }
     return data;
   }
@@ -377,7 +425,7 @@
         const close = document.createElement("button");
         close.className = "project-close";
         close.type = "button";
-        close.textContent = "×";
+        close.textContent = "x";
         close.title = "Close project";
         close.setAttribute("aria-label", `Close ${project.name}`);
         close.addEventListener("click", (event) => {
@@ -496,6 +544,8 @@
     state.activeProjectId = id;
     renderProjects();
     renderActiveProject();
+    if (els.memoryDialog.open) closeMemoryDialog();
+    state.memory.editingDoc = null;
   }
 
   function startProjectRename(project) {
@@ -504,7 +554,7 @@
   }
 
   async function closeProject(project) {
-    if (!window.confirm(`Close “${project.name}”? All processes in this project will be terminated.`)) {
+    if (!window.confirm(`Archive "${project.name}"? Its processes stop, but the project is kept in the archive.`)) {
       return;
     }
     try {
@@ -521,6 +571,13 @@
     els.projectCwd.textContent = project ? project.cwd : "";
     els.projectCwd.title = project ? project.cwd : "";
     const projectKey = project ? String(project.id) : null;
+
+    // The memory list lives in this panel now, so it follows the active
+    // project instead of waiting for a toggle.
+    if (projectKey !== state.memory.loadedFor) {
+      state.memory.loadedFor = projectKey;
+      if (projectKey) void loadMemoryDocs();
+    }
 
     if (projectKey !== state.renderedProjectKey) {
       disposeHandles();
@@ -894,7 +951,7 @@
     const request = ++state.pickerRequest;
     state.pickerLoading = true;
     els.newProjectDialogCreate.disabled = true;
-    els.dirCurrent.textContent = "loading…";
+    els.dirCurrent.textContent = "loading...";
     try {
       const query = path ? `?path=${encodeURIComponent(path)}` : "";
       const listing = await api(`api/fs${query}`);
@@ -1020,6 +1077,608 @@
     }
   });
 
+  // Project memory drawer and archive panel are opt-in: nothing is fetched
+  // until their toggle is pressed, except the archive badge count.
+
+  function memoryWorkspaceQuery() {
+    const project = state.projects.find((entry) => entry.id === state.activeProjectId);
+    return project && project.cwd ? project.cwd : "";
+  }
+
+  function withMemoryWorkspace(path) {
+    const workspace = memoryWorkspaceQuery();
+    if (!workspace) return path;
+    const separator = path.includes("?") ? "&" : "?";
+    return `${path}${separator}workspace=${encodeURIComponent(workspace)}`;
+  }
+
+  function showMemoryEditorError(message) {
+    els.memoryEditorError.textContent = message;
+    els.memoryEditorError.hidden = false;
+  }
+
+  function showMemoryListError(message) {
+    els.memoryListError.textContent = message;
+    els.memoryListError.hidden = false;
+  }
+
+  function renderMemoryStatus() {
+    const status = state.memory.status;
+    if (!status || status.state === "not_applicable") {
+      els.memoryStatus.hidden = true;
+      els.memoryStatusRecheck.hidden = true;
+      return;
+    }
+    const ready = status.state === "ready";
+    els.memoryStatus.hidden = false;
+    els.memoryStatus.classList.toggle("warning", !ready);
+    els.memoryStatusMessage.textContent = ready
+      ? "pi memory server connected"
+      : status.message || `project memory is ${status.state}.`;
+    const advice = ready ? "" : (status.advice || "").trim();
+    els.memoryStatusAdvice.textContent = advice;
+    els.memoryStatusAdvice.hidden = advice === "";
+    // Nothing to re-check once the probe is happy; the button only exists to
+    // recover from a missing or broken MCP entry.
+    els.memoryStatusRecheck.hidden = ready;
+  }
+
+  async function loadMemoryStatus(refresh = false) {
+    try {
+      state.memory.status = await api(
+        refresh ? "api/memory/status?refresh=1" : "api/memory/status",
+      );
+    } catch (error) {
+      if (error.message === "unauthorized") return;
+      state.memory.status = {
+        enabled: false,
+        state: "invalid",
+        message: error.message,
+        advice: null,
+      };
+    }
+    renderMemoryStatus();
+  }
+
+  async function loadMemoryDocs() {
+    try {
+      const data = await api(withMemoryWorkspace("api/memory/docs"));
+      state.memory.docs = data && Array.isArray(data.docs) ? data.docs : [];
+      els.memoryListError.hidden = true;
+      renderMemoryList();
+    } catch (error) {
+      if (error.message === "unauthorized") return;
+      state.memory.docs = [];
+      state.memory.hits = [];
+      els.memoryList.replaceChildren();
+      showMemoryListError(error.message);
+    }
+  }
+
+  function memoryMetaLine(parts) {
+    return parts.filter((part) => part !== null && part !== undefined && part !== "").join(" - ");
+  }
+
+  function memoryEmptyRow(message) {
+    const item = document.createElement("li");
+    item.className = "memory-empty";
+    item.textContent = message;
+    return item;
+  }
+
+  function memoryItem(parts) {
+    const { title, meta, snippet, onOpen } = parts;
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "memory-item";
+
+    const titleEl = document.createElement("span");
+    titleEl.className = "memory-item-title";
+    titleEl.textContent = title;
+    button.append(titleEl);
+
+    if (snippet) {
+      const snippetEl = document.createElement("span");
+      snippetEl.className = "memory-item-snippet";
+      snippetEl.textContent = snippet;
+      button.append(snippetEl);
+    }
+
+    const metaEl = document.createElement("span");
+    metaEl.className = "memory-item-meta";
+    metaEl.textContent = memoryMetaLine(meta);
+    button.append(metaEl);
+
+    button.addEventListener("click", onOpen);
+    item.append(button);
+    return item;
+  }
+
+  function renderMemoryList() {
+    els.memoryList.replaceChildren();
+    if (state.memory.query) {
+      if (!state.memory.hits.length) {
+        els.memoryList.append(memoryEmptyRow("no matches"));
+        return;
+      }
+      for (const hit of state.memory.hits) {
+        els.memoryList.append(memoryItem({
+          title: hit.title || hit.slug,
+          meta: [hit.kind],
+          snippet: hit.snippet,
+          onOpen: () => {
+            void openMemoryDoc(hit.slug);
+          },
+        }));
+      }
+      return;
+    }
+    if (!state.memory.docs.length) {
+      els.memoryList.append(memoryEmptyRow("no docs yet"));
+      return;
+    }
+    for (const doc of state.memory.docs) {
+      els.memoryList.append(memoryItem({
+        title: doc.title || doc.slug,
+        meta: [doc.kind, doc.updated, doc.author],
+        onOpen: () => {
+          void openMemoryDoc(doc.slug);
+        },
+      }));
+    }
+  }
+
+  async function openMemoryDoc(slug, workspace) {
+    if (!slug) return;
+    state.memory.editingWorkspace = workspace || null;
+    try {
+      const doc = await api(
+        withEditingWorkspace(`api/memory/docs/${encodeURIComponent(slug)}`),
+      );
+      openMemoryEditor(doc);
+    } catch (error) {
+      if (error.message !== "unauthorized") showToast(`could not open doc: ${error.message}`);
+    }
+  }
+
+  function openMemoryEditor(doc) {
+    state.memory.editingDoc = doc || null;
+    if (!doc) state.memory.editingWorkspace = null;
+    els.memoryDialogTitle.textContent = doc ? "edit doc" : "new doc";
+    els.memoryTitle.value = doc ? doc.title || "" : "";
+    els.memoryKind.value = doc && MEMORY_KINDS.includes(doc.kind) ? doc.kind : "note";
+    els.memoryTags.value = doc && Array.isArray(doc.tags) ? doc.tags.join(", ") : "";
+    els.memoryBody.value = doc ? doc.body || "" : "";
+    els.memoryEditorError.hidden = true;
+    els.memoryReload.hidden = true;
+    els.memoryDelete.hidden = !doc;
+    if (!els.memoryDialog.open) els.memoryDialog.showModal();
+    els.memoryTitle.focus();
+  }
+
+  function closeMemoryEditor() {
+    state.memory.editingDoc = null;
+    state.memory.editingWorkspace = null;
+    els.memoryEditorError.hidden = true;
+    els.memoryReload.hidden = true;
+    els.memoryDelete.hidden = true;
+    if (els.memoryDialog.open) els.memoryDialog.close();
+  }
+
+  function parseMemoryTags(value) {
+    return value
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter((tag) => tag.length > 0);
+  }
+
+  async function saveMemoryDoc() {
+    const title = els.memoryTitle.value.trim();
+    if (!title) {
+      showMemoryEditorError("Add a title first.");
+      return;
+    }
+    const body = els.memoryBody.value;
+    const kind = els.memoryKind.value;
+    const tags = parseMemoryTags(els.memoryTags.value);
+    const editing = state.memory.editingDoc;
+    els.memorySave.disabled = true;
+    els.memoryEditorError.hidden = true;
+    const workspace = state.memory.editingWorkspace || memoryWorkspaceQuery();
+    try {
+      if (editing) {
+        await api(withEditingWorkspace(`api/memory/docs/${encodeURIComponent(editing.slug)}`), {
+          method: "PUT",
+          mutation: true,
+          headers: editing.hash ? { "If-Match": editing.hash } : undefined,
+          body: { body, title, kind, tags, workspace },
+        });
+      } else {
+        await api("api/memory/docs", {
+          method: "POST",
+          mutation: true,
+          body: { title, kind, body, tags, workspace },
+        });
+      }
+      closeMemoryEditor();
+      showToast("Saved to project memory");
+      void loadMemoryDocs();
+    } catch (error) {
+      if (error.status === 409) {
+        showMemoryEditorError("someone else changed this doc; copy your text, then reload");
+        els.memoryReload.hidden = false;
+      } else if (error.message !== "unauthorized") {
+        showMemoryEditorError(error.message);
+      }
+    } finally {
+      els.memorySave.disabled = false;
+    }
+  }
+
+  async function reloadMemoryDoc() {
+    const editing = state.memory.editingDoc;
+    if (!editing) return;
+    try {
+      const doc = await api(
+        withEditingWorkspace(`api/memory/docs/${encodeURIComponent(editing.slug)}`),
+      );
+      openMemoryEditor(doc);
+      showToast("Reloaded doc from server");
+      void loadMemoryDocs();
+    } catch (error) {
+      if (error.message !== "unauthorized") showMemoryEditorError(error.message);
+    }
+  }
+
+  async function deleteMemoryDoc() {
+    const editing = state.memory.editingDoc;
+    if (!editing) return;
+    const label = editing.title || editing.slug;
+    if (!window.confirm(`Delete "${label}" from project memory?`)) return;
+    els.memoryDelete.disabled = true;
+    try {
+      await api(withEditingWorkspace(`api/memory/docs/${encodeURIComponent(editing.slug)}`), {
+        method: "DELETE",
+        mutation: true,
+      });
+      closeMemoryEditor();
+      showToast("Doc deleted");
+      void loadMemoryDocs();
+    } catch (error) {
+      if (error.message !== "unauthorized") showMemoryEditorError(error.message);
+    } finally {
+      els.memoryDelete.disabled = false;
+    }
+  }
+
+  function scheduleMemorySearch() {
+    window.clearTimeout(state.memory.searchTimer);
+    state.memory.query = els.memorySearch.value.trim();
+    if (!state.memory.query) {
+      state.memory.hits = [];
+      state.memory.searchToken += 1;
+      els.memoryListError.hidden = true;
+      renderMemoryList();
+      return;
+    }
+    state.memory.searchTimer = window.setTimeout(() => {
+      void runMemorySearch();
+    }, 200);
+  }
+
+  async function runMemorySearch() {
+    const query = state.memory.query;
+    if (!query) return;
+    const token = ++state.memory.searchToken;
+    try {
+      const data = await api(
+        withMemoryWorkspace(`api/memory/search?q=${encodeURIComponent(query)}`),
+      );
+      if (token !== state.memory.searchToken) return;
+      state.memory.hits = data && Array.isArray(data.hits) ? data.hits : [];
+      els.memoryListError.hidden = true;
+      renderMemoryList();
+    } catch (error) {
+      if (token !== state.memory.searchToken || error.message === "unauthorized") return;
+      state.memory.hits = [];
+      els.memoryList.replaceChildren();
+      showMemoryListError(error.message);
+    }
+  }
+
+  function withEditingWorkspace(path) {
+    const workspace = state.memory.editingWorkspace;
+    if (!workspace) return withMemoryWorkspace(path);
+    const separator = path.includes("?") ? "&" : "?";
+    return `${path}${separator}workspace=${encodeURIComponent(workspace)}`;
+  }
+
+  function closeMemoryDialog() {
+    closeMemoryEditor();
+  }
+
+  function countLabel(count, noun) {
+    const value = Number(count) || 0;
+    return `${value} ${noun}${value === 1 ? "" : "s"}`;
+  }
+
+  function middleElide(text, max = 46) {
+    if (!text || text.length <= max) return text || "";
+    const tail = Math.ceil((max - 1) / 2);
+    const head = max - 1 - tail;
+    return `${text.slice(0, head)}...${text.slice(text.length - tail)}`;
+  }
+
+  function formatArchiveDate(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+  }
+
+  function archiveEntries(data) {
+    return data && data.readable && Array.isArray(data.entries) ? data.entries : [];
+  }
+
+  function updateArchiveToggle() {
+    const count = state.archive.count;
+    els.archiveToggle.title = count > 0 ? `archived projects (${count})` : "archived projects";
+    els.archiveToggle.classList.toggle("has-archived", count > 0);
+  }
+
+  async function fetchArchive() {
+    try {
+      state.archive.data = await api("api/archive");
+      state.archive.error = null;
+    } catch (error) {
+      if (error.message === "unauthorized") return;
+      state.archive.data = null;
+      state.archive.error = error.message;
+    }
+    state.archive.count = archiveEntries(state.archive.data).length;
+    updateArchiveToggle();
+  }
+
+  function forgetArchivedEntry(id) {
+    const remaining = archiveEntries(state.archive.data).filter((entry) => entry.id !== id);
+    if (state.archive.data) state.archive.data.entries = remaining;
+    state.archive.count = remaining.length;
+    updateArchiveToggle();
+  }
+
+  async function restoreArchivedProject(entry, button) {
+    button.disabled = true;
+    try {
+      await api(`api/archive/${encodeURIComponent(entry.id)}/restore`, {
+        method: "POST",
+        mutation: true,
+      });
+      closeArchiveDialog();
+      showToast(`Restored ${entry.name}`);
+      await refresh();
+      await fetchArchive();
+    } catch (error) {
+      button.disabled = false;
+      if (error.message !== "unauthorized") window.alert(error.message);
+    }
+  }
+
+  async function deleteArchivedProject(entry, button, input) {
+    button.disabled = true;
+    try {
+      await api(`api/archive/${encodeURIComponent(entry.id)}`, {
+        method: "DELETE",
+        mutation: true,
+      });
+      forgetArchivedEntry(entry.id);
+      showToast("Project deleted permanently");
+      renderArchive();
+    } catch (error) {
+      button.disabled = input.value !== entry.name;
+      if (error.message !== "unauthorized") window.alert(error.message);
+    }
+  }
+
+  function archiveConfirmArea(entry, trigger) {
+    const wrap = document.createElement("div");
+    wrap.className = "archive-confirm";
+    wrap.hidden = true;
+
+    const hint = document.createElement("span");
+    hint.className = "archive-confirm-hint";
+    hint.textContent = `type "${entry.name}" to confirm permanent deletion`;
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "archive-confirm-input";
+    input.placeholder = "type the project name to confirm";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.setAttribute("aria-label", `Type ${entry.name} to confirm deletion`);
+
+    const confirm = document.createElement("button");
+    confirm.type = "button";
+    confirm.className = "archive-action danger";
+    confirm.textContent = "confirm delete";
+    confirm.disabled = true;
+
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "archive-action";
+    cancel.textContent = "cancel";
+
+    input.addEventListener("input", () => {
+      confirm.disabled = input.value !== entry.name;
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !confirm.disabled) {
+        event.preventDefault();
+        void deleteArchivedProject(entry, confirm, input);
+      }
+    });
+    cancel.addEventListener("click", () => {
+      wrap.hidden = true;
+      input.value = "";
+      confirm.disabled = true;
+      trigger.focus();
+    });
+    confirm.addEventListener("click", () => {
+      void deleteArchivedProject(entry, confirm, input);
+    });
+
+    wrap.append(hint, input, confirm, cancel);
+    return wrap;
+  }
+
+  function archiveRow(entry) {
+    const item = document.createElement("li");
+    item.className = "archive-item";
+
+    const head = document.createElement("div");
+    head.className = "archive-item-head";
+
+    const name = document.createElement("span");
+    name.className = "archive-item-name";
+    name.textContent = entry.name;
+    name.title = entry.name;
+
+    const date = document.createElement("span");
+    date.className = "archive-item-date";
+    date.textContent = formatArchiveDate(entry.archived_at);
+
+    head.append(name, date);
+
+    const cwd = document.createElement("div");
+    cwd.className = "archive-item-cwd";
+    cwd.textContent = middleElide(entry.cwd);
+    cwd.title = entry.cwd || "";
+
+    const meta = document.createElement("div");
+    meta.className = "archive-item-meta";
+    const parts = [countLabel(entry.pane_count, "pane")];
+    if (entry.memory_docs !== null && entry.memory_docs !== undefined) {
+      parts.push(countLabel(entry.memory_docs, "doc"));
+    }
+    meta.textContent = parts.join(", ");
+
+    const actions = document.createElement("div");
+    actions.className = "archive-item-actions";
+
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.className = "archive-action";
+    restore.textContent = "restore";
+    restore.addEventListener("click", () => {
+      void restoreArchivedProject(entry, restore);
+    });
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "archive-action danger";
+    remove.textContent = "delete permanently";
+
+    const confirmArea = archiveConfirmArea(entry, remove);
+    remove.addEventListener("click", () => {
+      confirmArea.hidden = false;
+      const input = confirmArea.querySelector(".archive-confirm-input");
+      if (input) input.focus();
+    });
+
+    actions.append(restore, remove);
+    item.append(head, cwd, meta, actions, confirmArea);
+    return item;
+  }
+
+  function showArchiveError(message) {
+    els.archiveError.textContent = message;
+    els.archiveError.hidden = false;
+  }
+
+  function renderArchive() {
+    els.archiveList.replaceChildren();
+    els.archiveRetry.hidden = true;
+
+    const data = state.archive.data;
+    if (!data) {
+      if (state.archive.error) {
+        els.archiveEmpty.hidden = true;
+        showArchiveError(`The archive index could not be read. ${state.archive.error}`);
+        els.archiveRetry.hidden = false;
+      } else {
+        els.archiveError.hidden = true;
+        els.archiveEmpty.textContent = "loading...";
+        els.archiveEmpty.hidden = false;
+      }
+      return;
+    }
+
+    if (!data.readable) {
+      els.archiveEmpty.hidden = true;
+      const reason = data.error ? `: ${data.error}` : "";
+      showArchiveError(`The archive index could not be read${reason}`);
+      els.archiveRetry.hidden = false;
+      return;
+    }
+
+    els.archiveError.hidden = true;
+    const entries = archiveEntries(data);
+    if (!entries.length) {
+      els.archiveEmpty.textContent = "No archived projects";
+      els.archiveEmpty.hidden = false;
+      return;
+    }
+    els.archiveEmpty.hidden = true;
+    for (const entry of entries) els.archiveList.append(archiveRow(entry));
+  }
+
+  async function openArchiveDialog() {
+    if (els.archiveDialog.open) return;
+    els.archiveDialog.showModal();
+    renderArchive();
+    await fetchArchive();
+    renderArchive();
+  }
+
+  function closeArchiveDialog() {
+    if (els.archiveDialog.open) els.archiveDialog.close();
+  }
+
+  els.archiveToggle.addEventListener("click", () => {
+    void openArchiveDialog();
+  });
+  els.memoryClose.addEventListener("click", closeMemoryDialog);
+  els.archiveClose.addEventListener("click", closeArchiveDialog);
+  els.memoryDialog.addEventListener("close", () => {
+    state.memory.editingDoc = null;
+    els.memoryEditorError.hidden = true;
+    if (!els.projectManagement.hidden) els.memoryNew.focus();
+  });
+  els.archiveDialog.addEventListener("close", () => {
+    els.archiveToggle.focus();
+  });
+  els.memoryStatusRecheck.addEventListener("click", () => {
+    void loadMemoryStatus(true);
+  });
+  els.memorySearch.addEventListener("input", scheduleMemorySearch);
+  els.memoryNew.addEventListener("click", () => openMemoryEditor(null));
+  els.memorySave.addEventListener("click", () => {
+    void saveMemoryDoc();
+  });
+  els.memoryReload.addEventListener("click", () => {
+    void reloadMemoryDoc();
+  });
+  els.memoryDelete.addEventListener("click", () => {
+    void deleteMemoryDoc();
+  });
+  els.memoryCancel.addEventListener("click", closeMemoryEditor);
+  els.archiveRetry.addEventListener("click", async () => {
+    state.archive.data = null;
+    state.archive.error = null;
+    renderArchive();
+    await fetchArchive();
+    renderArchive();
+  });
+
   els.logout.addEventListener("click", async () => {
     try {
       await api("logout", { method: "POST", mutation: true });
@@ -1053,4 +1712,9 @@
   });
 
   refresh();
+  // Two small eager fetches, both needed for the sidebar badges and warning
+  // marker: the archived-projects count, and the memory readiness verdict.
+  // The drawer's document list still stays untouched until it is opened.
+  void fetchArchive();
+  void loadMemoryStatus();
 })();

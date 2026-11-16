@@ -1,14 +1,16 @@
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use mmux::auth::{self, PamAuthenticator};
 use mmux::config::{Config, DEFAULT_CONFIG_TOML};
+use mmux::memory::{self, Memory, MemoryReadiness, cli as memcli};
 use mmux::persistence;
 use mmux::session::SessionStore;
 use mmux::web::{self, AppState};
@@ -22,16 +24,27 @@ use mmux::workspace::Workspace;
 )]
 struct Cli {
     /// Path to a TOML config file (default: ~/.config/mmux.toml).
-    #[arg(long, env = "MMUX_CONFIG", value_name = "PATH")]
+    #[arg(long, env = "MMUX_CONFIG", value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
     /// Override the configured listen address.
-    #[arg(long, env = "MMUX_BIND", value_name = "ADDR")]
+    #[arg(long, env = "MMUX_BIND", value_name = "ADDR", global = true)]
     bind: Option<SocketAddr>,
 
     /// Print the documented default configuration and exit.
     #[arg(long)]
     print_default_config: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Inspect and edit the project memory vault.
+    Mem(memcli::MemArgs),
+    /// Run the memory MCP server on stdin/stdout (used by pi).
+    Mcp,
 }
 
 #[tokio::main]
@@ -53,10 +66,15 @@ async fn main() -> anyhow::Result<()> {
         config.server.bind = bind;
     }
     config.validate().map_err(anyhow::Error::msg)?;
-    run(config).await
+
+    match cli.command {
+        Some(Command::Mem(args)) => memcli::run(&config, args),
+        Some(Command::Mcp) => memcli::run_mcp(&config),
+        None => run(config, cli.config.as_deref()).await,
+    }
 }
 
-async fn run(config: Config) -> anyhow::Result<()> {
+async fn run(config: Config, config_path: Option<&Path>) -> anyhow::Result<()> {
     let workspace =
         Arc::new(Workspace::new(&config.workspace.root).with_context(|| {
             format!("invalid workspace root {}", config.workspace.root.display())
@@ -82,12 +100,29 @@ async fn run(config: Config) -> anyhow::Result<()> {
                 )
             }
         }
-        .with_appearance(config.terminal.appearance),
+        .with_appearance(config.terminal.appearance)
+        .with_identity_env(identity_env(config_path)),
     );
     if let Some(path) = state_dir.as_ref() {
         tracing::info!(state = %path.display(), "project persistence enabled");
     }
     sessions.restore().await;
+
+    // Memory is optional: when it is disabled or there is no state directory,
+    // the rest of mmux works exactly as before.
+    let memory = Memory::from_config(&config.memory, state_dir.as_deref()).map(Arc::new);
+    let readiness = if memory.is_some() {
+        memory::readiness::check(&config.memory)
+    } else {
+        MemoryReadiness::NotApplicable
+    };
+    if let Some(message) = readiness.message() {
+        tracing::warn!("{message}");
+        if let Some(advice) = readiness.advice() {
+            tracing::info!("{advice}");
+        }
+    }
+
     let config = Arc::new(config);
     let bind = config.server.bind;
 
@@ -114,6 +149,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
         workspace,
         authenticator,
         user,
+        memory,
+        readiness,
     ));
 
     tracing::info!("listening on http://{local_addr}");
@@ -154,12 +191,24 @@ async fn shutdown_signal() {
     }
 }
 
+/// Identity, not configuration: children need to know which file the server
+/// was started with so `mmux mem` and `mmux mcp` read the same vault.
+fn identity_env(config_path: Option<&Path>) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    if let Some(path) = config_path {
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        env.insert("MMUX_CONFIG".into(), path.to_string_lossy().into_owned());
+    }
+    env
+}
+
 fn init_tracing(default_filter: &str) {
     // `RUST_LOG` is an escape hatch for debugging, not the configuration
     // surface; the documented default is `[logging].filter` in mmux.toml.
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_target(false)
         .with_ansi(std::io::stderr().is_terminal())

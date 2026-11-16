@@ -1,5 +1,6 @@
 pub mod pane;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -64,6 +65,8 @@ pub enum SessionEvent {
 pub enum SessionError {
     #[error("invalid project name: {0}")]
     InvalidName(String),
+    #[error("{0}")]
+    Conflict(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -102,6 +105,10 @@ pub struct SessionStore {
     /// can retry instead of losing the project definition.
     unrestored: Mutex<Vec<ProjectRecord>>,
     persist_lock: Mutex<()>,
+    /// Static identity variables handed to every pane (currently `MMUX_CONFIG`
+    /// when the server was started with a non-default config file). Settings
+    /// never travel through the environment.
+    identity_env: BTreeMap<String, String>,
 }
 
 struct Project {
@@ -148,7 +155,14 @@ impl SessionStore {
             state_trusted: AtomicBool::new(true),
             unrestored: Mutex::new(Vec::new()),
             persist_lock: Mutex::new(()),
+            identity_env: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Adds identity variables (not settings) to every pane this store spawns.
+    pub fn with_identity_env(mut self, env: BTreeMap<String, String>) -> Self {
+        self.identity_env = env;
+        self
     }
 
     pub fn with_appearance(mut self, appearance: Appearance) -> Self {
@@ -250,11 +264,16 @@ impl SessionStore {
         let specs: Vec<(Slot, PaneSpec)> = pane_configs
             .iter()
             .map(|config| {
+                let command = resolve_command(&config.command)?;
+                let mut env =
+                    self.pane_identity_env(project_id, &name, &cwd, config.slot, &command);
+                // Explicit per-pane configuration wins over mmux defaults.
+                env.extend(config.env.clone());
                 Ok((
                     config.slot,
                     PaneSpec {
-                        command: resolve_command(&config.command)?,
-                        env: config.env.clone(),
+                        command,
+                        env,
                         cwd: cwd.clone(),
                         appearance: self.appearance,
                     },
@@ -287,6 +306,38 @@ impl SessionStore {
         self.projects.write().await.push(project);
         self.broadcast();
         Ok(view)
+    }
+
+    /// Identity, not configuration: these tell a child which pane it is in and
+    /// which agent is running, and every one of them degrades to a fallback.
+    fn pane_identity_env(
+        &self,
+        project_id: ProjectId,
+        name: &str,
+        cwd: &Path,
+        slot: Slot,
+        command: &[String],
+    ) -> BTreeMap<String, String> {
+        let mut env = self.identity_env.clone();
+        env.insert("MMUX_PROJECT_ID".into(), project_id.get().to_string());
+        env.insert("MMUX_PROJECT_NAME".into(), name.to_owned());
+        env.insert(
+            "MMUX_PROJECT_CWD".into(),
+            cwd.to_string_lossy().into_owned(),
+        );
+        env.insert("MMUX_PANE_SLOT".into(), slot.to_string());
+        if let Some(session) = session_id_in(command) {
+            env.insert("MMUX_SESSION_ID".into(), session);
+        }
+        if command
+            .first()
+            .and_then(|program| Path::new(program).file_name())
+            .and_then(|name| name.to_str())
+            == Some("pi")
+        {
+            env.insert("MMUX_AGENT".into(), "pi".into());
+        }
+        env
     }
 
     pub async fn rename_project(&self, id: ProjectId, name: &str) -> Result<bool, SessionError> {
@@ -345,38 +396,100 @@ impl SessionStore {
         true
     }
 
-    /// Closes a project and terminates all of its panes.
-    pub async fn close_project(&self, id: ProjectId) -> bool {
-        let removed = {
+    /// Closes a project: panes stop and the project moves to the archive.
+    /// Closing is never destructive, and it never touches workspace memory.
+    pub async fn archive_project(&self, id: ProjectId) -> bool {
+        let (removed, position) = {
             let mut projects = self.projects.write().await;
             let Some(index) = projects.iter().position(|project| project.id == id) else {
                 return false;
             };
-            projects.remove(index)
+            let position = index;
+            (projects.remove(index), position)
         };
         for pane in &removed.panes {
             pane.terminate();
         }
         self.broadcast();
+        // Persist the live index first: if the move fails, the directory is
+        // still on disk and the archive scan will find it next time.
         if self.persist().await
             && let Some(state_dir) = self.state_dir.clone()
         {
-            let storage_id = removed.storage_id;
-            let removed = tokio::task::spawn_blocking(move || {
-                persistence::delete_project(&state_dir, storage_id)
+            let record = removed.record();
+            let archived = tokio::task::spawn_blocking(move || {
+                persistence::archive(&state_dir, &record, position)
             })
             .await;
-            match removed {
+            match archived {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    tracing::warn!(error = %err, "could not remove closed project directory");
+                    tracing::warn!(error = %err, "could not move closed project to the archive");
                 }
                 Err(err) => {
-                    tracing::warn!(error = %err, "closed project cleanup task failed");
+                    tracing::warn!(error = %err, "archive task failed");
                 }
             }
         }
         true
+    }
+
+    /// Archived projects, newest first. Empty when persistence is disabled.
+    pub async fn archived_projects(&self) -> anyhow::Result<Vec<persistence::ArchivedProject>> {
+        let Some(state_dir) = self.state_dir.clone() else {
+            return Ok(Vec::new());
+        };
+        tokio::task::spawn_blocking(move || persistence::load_archive(&state_dir))
+            .await
+            .map_err(|err| anyhow::anyhow!("archive read task failed: {err}"))?
+    }
+
+    /// Permanently removes an archived project. Workspace memory is untouched.
+    pub async fn delete_archived(&self, id: Uuid) -> anyhow::Result<()> {
+        let Some(state_dir) = self.state_dir.clone() else {
+            anyhow::bail!("project persistence is disabled");
+        };
+        tokio::task::spawn_blocking(move || persistence::delete_archived(&state_dir, id))
+            .await
+            .map_err(|err| anyhow::anyhow!("archive cleanup task failed: {err}"))?
+    }
+
+    /// Moves an archived project back and starts its panes from the saved
+    /// definitions, reusing the same storage UUID.
+    pub async fn restore_archived(&self, id: Uuid) -> Result<ProjectView, SessionError> {
+        if self
+            .projects
+            .read()
+            .await
+            .iter()
+            .any(|project| project.storage_id == id)
+        {
+            return Err(SessionError::Conflict("project is already open".into()));
+        }
+        let Some(state_dir) = self.state_dir.clone() else {
+            return Err(SessionError::Other(anyhow::anyhow!(
+                "project persistence is disabled"
+            )));
+        };
+        let record =
+            tokio::task::spawn_blocking(move || persistence::restore_archived(&state_dir, id))
+                .await
+                .map_err(|err| SessionError::Other(err.into()))?
+                .map_err(SessionError::Other)?;
+
+        let cwd = PathBuf::from(&record.cwd);
+        let name = if validate_label(&record.name).is_ok() {
+            record.name.trim().to_owned()
+        } else {
+            default_project_name(&cwd)
+        };
+        // Stored pane definitions normally already carry resolved session IDs;
+        // resolve any placeholders defensively so an older record still resumes
+        // instead of passing a literal `{session_id}` to the program.
+        let panes = resolve_session_ids(&record.panes);
+        let view = self.spawn_project(record.id, name, cwd, &panes).await?;
+        self.persist().await;
+        Ok(view)
     }
 
     pub async fn snapshot(&self) -> Vec<ProjectView> {
@@ -525,6 +638,15 @@ fn resolve_session_ids(panes: &[PaneConfig]) -> Vec<PaneConfig> {
 
 pub const SESSION_ID_PLACEHOLDER: &str = "{session_id}";
 
+/// The resolved `--session-id` a pane command carries, if any.
+fn session_id_in(command: &[String]) -> Option<String> {
+    command
+        .iter()
+        .position(|arg| arg == "--session-id")
+        .and_then(|index| command.get(index + 1))
+        .cloned()
+}
+
 fn resolve_project_name(name: Option<String>, cwd: &Path) -> Result<String, SessionError> {
     if let Some(name) = name {
         let name = name.trim();
@@ -630,8 +752,8 @@ mod tests {
             .unwrap();
         assert!(store.rename_project(view.id, "work").await.unwrap());
         assert_eq!(store.snapshot().await[0].name, "work");
-        assert!(!store.close_project(ProjectId::new(9999)).await);
-        assert!(store.close_project(view.id).await);
+        assert!(!store.archive_project(ProjectId::new(9999)).await);
+        assert!(store.archive_project(view.id).await);
         assert_eq!(store.project_count().await, 0);
         store.shutdown().await;
     }
@@ -714,7 +836,7 @@ mod tests {
             .unwrap();
         let pane = store.pane(view.panes[0].id).await.unwrap();
         assert!(pane.is_running());
-        assert!(store.close_project(view.id).await);
+        assert!(store.archive_project(view.id).await);
         assert!(
             wait_for(|| !pane.is_running(), Duration::from_secs(4)).await,
             "pane did not stop"
@@ -742,7 +864,7 @@ mod tests {
             events.recv().await.unwrap(),
             SessionEvent::ProjectsChanged
         ));
-        store.close_project(view.id).await;
+        store.archive_project(view.id).await;
         assert!(matches!(
             events.recv().await.unwrap(),
             SessionEvent::ProjectsChanged
@@ -887,13 +1009,23 @@ mod tests {
         let storage_id = persistence::load(&state).unwrap()[0].id;
         let project_dir = persistence::project_dir(&state, storage_id);
         assert!(project_dir.is_dir());
-        store.close_project(view.id).await;
-        assert!(!project_dir.exists(), "closed project directory was kept");
+        store.archive_project(view.id).await;
+        assert!(
+            !project_dir.exists(),
+            "closed project must leave the live directory"
+        );
+        let archived_dir = persistence::archive_dir(&state, storage_id);
+        assert!(
+            archived_dir.is_dir(),
+            "closed project must be preserved in the archive"
+        );
+        assert_eq!(store.archived_projects().await.unwrap().len(), 1);
         store.shutdown().await;
 
         let restored = SessionStore::with_state_dir(template, (24, 80), state);
         assert_eq!(restored.restore().await, 0);
         assert!(restored.snapshot().await.is_empty());
+        assert_eq!(restored.archived_projects().await.unwrap().len(), 1);
         restored.shutdown().await;
     }
 

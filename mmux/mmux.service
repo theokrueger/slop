@@ -11,7 +11,7 @@ Type=simple
 #
 # Prepend Pi and user-local tools without replacing the inherited PATH.
 # $$ escapes systemd expansion so Bash can extend the value it receives.
-ExecStart=/bin/bash -lc 'export PATH="%h/.pi/agent/bin:%h/.local/share/pi-node/current/bin:%h/.local/bin:$$PATH"; exec %h/.cargo/bin/mmux'
+ExecStart=/bin/bash -lc 'export PATH="%h/.pi/agent/bin:%h/.local/share/pi-node/current/bin:%h/.local/bin:%h/.cargo/bin:$$PATH"; exec %h/.cargo/bin/mmux'
 Restart=on-failure
 RestartSec=2
 KillMode=control-group

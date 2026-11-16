@@ -20,16 +20,15 @@ tracker, `claude-mem` field reports) converges on uncomfortable findings:
 - What survives is boring: append-only source data, a small curated index,
   explicit on-demand retrieval, audit-able provenance.
 
-So: two layers, both plaintext, and the agent fetches on demand.
+So: one plaintext layer, and the agent fetches on demand.
 
 | Layer | Contents | Written by | Purpose |
 | --- | --- | --- | --- |
 | **Docs** (memory proper) | meta-docs: decisions, plans, runbooks, notes, retros | a human, or an agent *when asked* | durable knowledge |
-| **History** | terminal transcripts + pi session transcripts | mmux, automatically | recall and search |
 
-Closing a project never destroys either layer: the project definition moves to
-the **project archive** (see §5.4.1) and memory is keyed by workspace path, so
-it survives archive, restore, and even permanent deletion of the project.
+Closing a project never destroys it: the project definition moves to the
+**project archive** (see §5.4.1) and memory is keyed by workspace path, so it
+survives archive, restore, and even permanent deletion of the project.
 
 Nothing auto-summarizes. Nothing is written into a project repository. Nothing
 is injected into a prompt beyond one server-description line.
@@ -37,6 +36,27 @@ is injected into a prompt beyond one server-description line.
 Explicit non-goals: SQLite or any database, embeddings, vector search,
 knowledge graphs, background LLM distillation, screen replay into live panes,
 and writing `AGENTS.md`/`CLAUDE.md`/`.pi/mcp.json` into repos.
+
+## 1.1 Implementation status
+
+Landed and covered by tests:
+
+- **Phase 1 — vault + MCP.** `src/memory/{doc,vault,ops,search,identity,readiness,mcp,cli}.rs`.
+  `mmux mem …` (add/edit/append/rm/list/show/search/history/status) and
+  `mmux mcp` (three tools). `[memory]` config with validation. Read-only
+  startup probe of pi's `mcp.json`. HTTP endpoints for docs, search, and status.
+  The memory list lives in the project side panel; only new/edit use a modal.
+- **Phase 2a — project archive.** `persistence::{archive,load_archive,restore_archived,delete_archived}`,
+  `SessionStore::{archive_project,archived_projects,restore_archived,delete_archived}`,
+  `/api/archive` endpoints, and the `[a]` panel with typed-confirmation deletion.
+- **Phase 2b — removed by decision.** Session/transcript search was dropped:
+  pi already ships session browsing (`--resume`, `/resume`), and duplicating it
+  in mmux added a second, staler view of the same data.
+
+Not implemented, and not pretended otherwise:
+
+- `mmux mem prune`, `mmux mem stale`, `supersedes` filtering, `INDEX.md`
+  generation, the generated pi skill, and the deterministic digest skeleton.
 
 ## 2. Principles
 
@@ -86,9 +106,6 @@ $XDG_STATE_HOME/mmux/
           <doc-slug>.md          # TOML frontmatter + markdown body
         _history/<doc-slug>/<utc-ns>.md
         INDEX.md                 # optional, generated, for humans
-    transcripts/
-      <workspace>/<YYYY-MM-DD>/<slot>-<pane-uuid>.log
-    pi-sessions.json             # pane -> pi session id + resolved file path
 ```
 
 Memory is keyed by workspace path, not project id, so closing and reopening a
@@ -171,7 +188,7 @@ so it loads the same `~/.config/mmux.toml` (or the file named by `--config` /
 
 ```toml
 [memory]
-# Master switch for the vault, the MCP server, and transcript capture.
+# Master switch for the vault and the MCP server.
 enabled = true
 # Vault root. Defaults to $XDG_STATE_HOME/mmux/memory.
 # dir = "~/.local/state/mmux/memory"
@@ -183,13 +200,6 @@ history_versions = 20
 agent_writes = "explicit"
 # pi integration for the readiness probe. mmux reads this, never writes it.
 pi_agent_dir = "~/.pi/agent"
-# pi session JSONL for the history layer. Defaults to <pi_agent_dir>/sessions.
-# pi_sessions = "~/.pi/agent/sessions"
-# Terminal history: "scrollback" or "off".
-terminal = "scrollback"
-scrollback_lines = 2000
-retention_days = 90
-max_workspace_bytes = 268435456
 ```
 
 [`config.example.toml`](../config.example.toml) carries the same keys, so
@@ -234,7 +244,6 @@ entry in `~/.pi/agent/mcp.json` works for every pane and every project:
         "memory_search": "direct",
         "memory_read": "direct",
         "memory_write": "deferred",
-        "history_*": "deferred",
         "memory_delete": "hidden"
       },
       "timeout": 20
@@ -282,11 +291,6 @@ Everything else is a TOML key.
 | `memory.history_versions` | int | `20` | `0..=100`; `0` disables history |
 | `memory.agent_writes` | enum | `"explicit"` | `explicit` \| `deny` |
 | `memory.pi_agent_dir` | path | `~/.pi/agent` | read-only; never created or written by mmux |
-| `memory.pi_sessions` | path | `<pi_agent_dir>/sessions` | read-only |
-| `memory.terminal` | enum | `"scrollback"` | `scrollback` \| `off` |
-| `memory.scrollback_lines` | int | `2000` | `0..=100000`; `0` forces `off` |
-| `memory.retention_days` | int | `90` | `1..=3650` |
-| `memory.max_workspace_bytes` | int | `268435456` | `1048576..=68719476736` |
 
 Deliberately **not** configuration, and therefore not keys:
 
@@ -341,7 +345,6 @@ Add this to <config>/mcp.json under "mcpServers" (mmux will not do it for you):
       "memory_search": "direct",
       "memory_read": "direct",
       "memory_write": "deferred",
-      "history_*": "deferred",
       "memory_delete": "hidden"
     }
   }
@@ -371,8 +374,6 @@ Few tools, each answering one question. All return compact text plus
 | `memory_search(query, kind?, tag?, workspace?, since?, limit?)` | direct | ranked index rows: slug, title, kind, updated, one-line snippet (~50–100 tokens/hit) |
 | `memory_read(slug, max_bytes?)` | direct | full doc with frontmatter and provenance |
 | `memory_write(title, kind, body, tags?, paths?, supersedes?, mode?"create"\|"append"\|"replace")` | deferred | save a doc; returns slug + hash |
-| `history_search(query, workspace?, since?, limit?)` | deferred | search terminal + pi transcripts, docs excluded |
-| `history_read(session, range?)` | deferred | one session's events/messages, bounded |
 | `memory_delete` | hidden | CLI/UI only; unattended deletion is a footgun |
 | `memory_list` | — | folded into `memory_search` with an empty query |
 
@@ -489,39 +490,25 @@ No index, so the algorithm must be good enough to not miss one:
 3. **Match.** Case-insensitive; whitespace-separated terms are AND; quoted
    strings are phrases; a leading `-` excludes.
 4. **Rank.** title hit ×10, tag ×6, phrase ×4, term coverage ×1, doc-kind
-   weight, recency boost; docs always outrank transcripts.
+   weight, recency boost.
 5. **Snippet.** ±80 chars around the first hit, whitespace-collapsed, control
    characters stripped.
 6. **Bounds.** Stop at `limit` (default 20, max 200) and a 2 s budget. Long
    scans run on a blocking pool with cancellation so a UI search cannot stall
    the async runtime.
 
-At 100 MB of logs this is a few hundred milliseconds worst case; with `--since`
-usually single-digit milliseconds. Docs are a few hundred KB, so they are
-effectively instant. If this ever stops being true, the answer is narrower
-scope and better retention caps — not a database.
+Docs are a few hundred KB, so search is effectively instant. If that ever stops
+being true, the answer is narrower scope — not a database.
 
-## 7. History, in plaintext
+## 7. Session history: removed
 
-- **pi sessions** are already plaintext JSONL and mmux already knows the session
-  ID. Resolve the file by scanning
-  `<pi_sessions>/--<cwd-slug>--/*_<id>.jsonl` (from `[memory] pi_sessions`),
-  record the resolved path in `pi-sessions.json`, and
-  parse incrementally. Extract only: user prompts, assistant text, tool names +
-  primary argument, bash commands + exit codes, files touched, compaction
-  boundaries. Never copy the JSONL; never re-parse a 4 MB file per query.
-- **Terminal transcripts**: raise the vt100 parser's scrollback
-  (`Parser::new_with_callbacks(rows, cols, 0, …)` at `src/session/pane.rs:285`
-  is the zero) to `[memory] scrollback_lines` (default 2000, tmux's default),
-  and flush newly retired lines to
-  `transcripts/<workspace>/<date>/<slot>-<pane>.log` on a ~1 s timer from a
-  dedicated thread. Plain text from the screen — no ANSI regex. Alt-screen
-  frames are skipped with a marker so `vim`/`less` do not flood the log.
-  A `-- mmux <RFC3339> --` marker line is inserted on an idle gap ≥ 2 s so the
-  log stays greppable and time-addressable.
-- **Retention**: per-pane log cap, `[memory] retention_days` (default 90),
-  workspace byte cap, GC on a cooldown, `mmux mem prune`. Closing a project
-  never deletes memory.
+An earlier draft indexed pi's session JSONL and captured terminal scrollback.
+Both were dropped: pi already provides session browsing (`--resume`, `/resume`,
+`--session`), and a second copy inside mmux would be staler than the source.
+Pi sessions are still readable by the user and by pi itself; mmux no longer
+reads or indexes them.
+
+Document revisions (`mmux mem history`) are unrelated and remain.
 
 ## 8. Phases
 
@@ -581,20 +568,12 @@ memory” true):
 - README: closing now archives; document the `[a]` panel, restore, and
   permanent deletion, and the fact that memory outlives both.
 
-**2b. Session history** (plaintext transcripts):
-
-- pi transcript resolver + incremental parser; `history_search`/`history_read`
-  MCP tools; HTTP timeline; terminal log writer in `pane.rs`; retention GC.
-- UI: sessions grouped by day (first prompt, duration, files touched, exits).
-
 Exit criteria: closing a project makes it appear under `[a]` with its memory doc
 count, and the entry survives a mmux restart; Restore brings back the same name,
 cwd, pane definitions, session IDs, and memory; Delete permanently removes only
 `archive/<uuid>/` and leaves `memory/` byte-identical; a corrupt
 `archive/index.json` shows the unreadable state while live projects and memory
-keep working. History search over 100 MB returns in < 1 s with `--since` and
-< 3 s without; a pane producing 50 MB does not grow RSS unboundedly or stall the
-PTY reader; `kill -9` loses ≤ 1 s of log.
+keep working.
 
 ### Phase 3 — Polish
 
@@ -611,13 +590,12 @@ PTY reader; `kill -9` loses ≤ 1 s of log.
 | Agent writes garbage memory | `memory_write` only on request; `agent_writes = "explicit"`; UI shows author + hash; history is revertible |
 | Stale or wrong `mcp.json` entry | read-only probe covers path drift, `enabled: false`, wrong exposure, and JSON errors; remediation text is copy-paste, and `status --refresh` re-checks |
 | Stale doc entries | 40-line index, `stale`, `supersedes`, `updated` shown in every hit |
-| Secret leakage in transcripts | terminal capture opt-out/stripped; never auto-injected; retention + `prune`; `0700` |
-| Scan cost growth | mtime scoping, byte/time caps, retention; no index by design |
+| Scan cost growth | mtime scoping and a per-query byte/time cap; no index by design |
 | MCP protocol drift | echo a version from pi's supported list; keep the server stateless and schema-minimal |
 | Workspace identity churn | stored absolute path + `mmux mem rekey` |
 | Injected args break user commands | none are injected: env vars only, and they are never persisted into `project.json` |
 | Archived project deleted by mistake | perma-delete only from the `[a]` panel with typed confirmation; memory is a separate filesystem tree and is never touched by it |
-| Archive grows without bound | no automatic expiry by design; the panel reports total size, deletion is manual, and docs/history have their own `retention_days` |
+| Archive grows without bound | no automatic expiry by design; the panel reports total size and deletion is manual |
 
 ## 10. Verification
 
@@ -643,8 +621,7 @@ PTY reader; `kill -9` loses ≤ 1 s of log.
   recursive hash before/after); failed move rolls back; corrupt archive index
   disables archive mutations only; `[a]` renders the unreadable state; delete
   requires typed confirmation in the UI and `X-MMUX` on the wire.
-- Perf: 10k docs search < 20 ms; 100 MB transcript scan bounded; incremental pi
-  parse touches only appended bytes.
+- Perf: 10k docs search < 20 ms.
 - Manual: `cargo fmt && cargo clippy --all-targets && cargo test`; two browsers
   editing one doc; `kill -9` mid-write; `pi mcp list` shows `mmux` connected with
   the expected tools.
@@ -662,6 +639,9 @@ startup, warns once, and publishes the verdict plus copy-paste remediation via
 
 Decided: `author` is inferred from `MMUX_*`/`PI_CODING_AGENT` at write time and
 frozen; it is provenance, not authorization.
+
+Decided: session/transcript history is out of scope. pi owns session browsing,
+so mmux keeps only documents and never indexes or copies transcripts.
 
 Decided: closing a project archives it. `projects/<id>/` moves to
 `archive/<id>/`, panes stop, the storage UUID is reused on restore, and nothing

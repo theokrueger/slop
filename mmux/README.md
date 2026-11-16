@@ -8,7 +8,11 @@ the same panes.
 
 - Four-slot pane grid: **top-left**, **top-right**, **bottom-left**, **bottom-right**
 - Vertical project list; projects can be created, renamed (double-click),
-  reordered by dragging, and closed
+  reordered by dragging, and archived (the `×` no longer destroys anything)
+- Closed projects move to an archive reached from the `[a]` button next to
+  `+ new project`, where they can be restored or deleted permanently
+- Project memory: a plaintext vault of meta-docs (decisions, plans, runbooks)
+  that agents read and write through an MCP server
 - A new project starts the configured pane template in a working directory
   chosen through an interactive directory picker
 - No projects are open on a fresh install
@@ -86,10 +90,24 @@ names, working directories, and pane definitions to a directory per project:
 ```text
 $XDG_STATE_HOME/mmux/
   projects/
-    index.json              # project IDs in sidebar order
+    index.json              # open project IDs in sidebar order
     <project-id>/
       project.json          # name, working directory, pane definitions
+  archive/
+    index.json              # archived project IDs, newest first
+    <project-id>/
+      project.json          # same format as projects/
+      archived.json         # archived_at, original position, pane count
+  memory/
+    workspaces.json         # working directory -> workspace key
+    workspaces/<key>/
+      docs/<slug>.md        # memory documents (TOML frontmatter + markdown)
+      _history/<slug>/      # previous revisions
 ```
+
+Closing a project moves `projects/<id>/` to `archive/<id>/` instead of deleting
+it. Memory is keyed by working directory, so it is untouched by archiving,
+restoring, or even permanently deleting a project.
 
 Each project keeps a stable ID across renames, reorders, and restarts, so
 future per-project state can live beside its `project.json`. An older
@@ -118,7 +136,8 @@ mmux refuses to overwrite saved state that it could not fully load.
 - Disconnecting all browsers pauses nothing. Reconnecting (or opening a second
   browser) replays the current screen.
 - When a pane's command exits, mmux starts a new instance of the same command
-  after a short delay. Closing the project or stopping mmux does not restart it.
+  after a short delay. Archiving the project or stopping mmux does not restart
+  it.
 - Restarting mmux ends the running processes, but restores the persisted
   projects and starts their panes again.
 - Multiple browsers share input and output for a pane, like attaching to the
@@ -151,6 +170,13 @@ appearance = "dark"    # "dark" or "light"
 
 [logging]
 filter = "mmux=info,tower_http=warn"
+
+[memory]
+enabled = true
+max_doc_bytes = 65536
+history_versions = 20
+agent_writes = "explicit"      # or "deny"
+pi_agent_dir = "~/.pi/agent"   # read-only; mmux never writes pi config
 
 # Used for every newly created project. Projects are created from the UI in
 # the directory chosen there, and persisted for the next mmux start.
@@ -191,6 +217,75 @@ command = []
 - The directory picker is confined to `workspace.root`. Paths are
   canonicalized; symlinks that escape the root are rejected. Set
   `workspace.root = "/"` if you want unrestricted browsing.
+
+## Project memory
+
+mmux keeps a plaintext memory vault per working directory, so durable knowledge
+survives restarts, archived projects, and new conversation contexts. There is no
+database and no background summarization: documents exist because someone saved
+them.
+
+**Documents.** Markdown with TOML frontmatter (`title`, `slug`, `kind`, `tags`,
+`author`, `source`, `paths`, `supersedes`). Kinds are `note`, `decision`,
+`plan`, `runbook`, `retro`, `reference`. Revisions are kept in `_history/`.
+From a shell in a project directory:
+
+```sh
+mmux mem add --title "Why panes restart" --kind decision --tag session
+mmux mem list                 # SLUG / KIND / UPDATED / TITLE
+mmux mem search restart       # quoted phrases and -exclusions work
+mmux mem show why-panes-restart
+mmux mem edit why-panes-restart --file notes.md
+mmux mem rm why-panes-restart --yes
+mmux mem history why-panes-restart
+```
+
+Every command accepts `--workspace PATH` (default: the current directory) and
+`--json`. Reads never create a vault; only writes do. The workspace is resolved
+by longest known path prefix, so running a command from a subdirectory still
+lands in the project's vault.
+
+**Agents reach memory over MCP.** `mmux mcp` is a stdio MCP server with three
+tools: `memory_search`, `memory_read`, and `memory_write`. It reads the same
+`mmux.toml` and resolves its workspace from
+the pane's working directory, so one entry in `~/.pi/agent/mcp.json` serves every
+project:
+
+```json
+{
+  "mcpServers": {
+    "mmux": {
+      "command": "mmux",
+      "args": ["mcp"],
+      "description": "Project memory: search, read, and write durable project notes",
+      "exposure": "deferred",
+      "toolExposure": {
+        "memory_search": "direct",
+        "memory_read": "direct",
+        "memory_write": "deferred"
+      },
+      "timeout": 20
+    }
+  }
+}
+```
+
+mmux never edits that file. It probes it once at startup and, if the entry is
+missing or would not work, logs one warning and shows the same remediation in
+the memory panel and in `mmux mem status`:
+
+```
+pi memory server not configured: no `mmux` entry in /home/you/.pi/agent/mcp.json
+…
+then restart pi panes, or run: pi mcp add mmux --exposure deferred -- mmux mcp
+```
+
+Set `[memory] agent_writes = "deny"` to make memory read-only for agents.
+
+**Privacy.** The vault lives under `$XDG_STATE_HOME/mmux/memory` with mode
+`0700`. Documents are only written when you or an agent explicitly save one, and
+mmux never injects them into a prompt on its own. Deleting an archived project
+removes only `archive/<id>/`; memory is separate and survives.
 
 ## Persistent user service
 
@@ -298,12 +393,14 @@ binary.
 src/
   auth.rs          PAM authentication + Unix account detection
   config.rs        TOML config, defaults, validation
-  persistence.rs   durable project registry
+  memory/          plaintext vault, search, MCP server, CLI
+  persistence.rs   durable project registry + archive
   session/         projects, panes, PTY ownership, terminal snapshots
   web/             axum routes, login/session handling, WebSocket protocol
   workspace.rs     confined directory picker
 web/               embedded frontend (vendored xterm.js)
 tests/web.rs       end-to-end HTTP + WebSocket tests
+tests/memory_mcp.rs  stdio MCP handshake, tools, and error containment
 ```
 
 ## License

@@ -9,7 +9,7 @@ use axum::extract::{FromRequestParts, Path, Request};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use time::Duration;
@@ -23,6 +23,7 @@ use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
 
 use crate::auth::Authenticator;
 use crate::config::Config;
+use crate::memory::{Memory, MemoryReadiness};
 use crate::session::SessionStore;
 use crate::workspace::Workspace;
 
@@ -48,16 +49,25 @@ pub struct AppState {
     pub workspace: Arc<Workspace>,
     pub auth: Arc<dyn Authenticator>,
     pub user: String,
+    /// The memory vault, absent when memory is disabled or there is no state
+    /// directory. Every feature degrades to "memory unavailable".
+    pub memory: Option<Arc<Memory>>,
+    /// Result of the startup probe of pi's MCP configuration. Replaced when a
+    /// client asks for a refresh, so fixing `mcp.json` needs no mmux restart.
+    pub readiness: Arc<parking_lot::RwLock<MemoryReadiness>>,
     next_client: Arc<AtomicU64>,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Arc<Config>,
         sessions: Arc<SessionStore>,
         workspace: Arc<Workspace>,
         auth: Arc<dyn Authenticator>,
         user: String,
+        memory: Option<Arc<Memory>>,
+        readiness: MemoryReadiness,
     ) -> Self {
         Self {
             config,
@@ -65,6 +75,8 @@ impl AppState {
             workspace,
             auth,
             user,
+            memory,
+            readiness: Arc::new(parking_lot::RwLock::new(readiness)),
             next_client: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -110,6 +122,21 @@ pub fn router(state: AppState) -> Router {
             "/api/projects/{id}",
             patch(api::rename_project).delete(api::close_project),
         )
+        .route("/api/memory/status", get(api::memory_status))
+        .route(
+            "/api/memory/docs",
+            get(api::memory_docs).post(api::memory_doc_create),
+        )
+        .route(
+            "/api/memory/docs/{slug}",
+            get(api::memory_doc_get)
+                .put(api::memory_doc_update)
+                .delete(api::memory_doc_delete),
+        )
+        .route("/api/memory/search", get(api::memory_search))
+        .route("/api/archive", get(api::archive_list))
+        .route("/api/archive/{id}/restore", post(api::archive_restore))
+        .route("/api/archive/{id}", delete(api::archive_delete))
         .route("/ws/panes/{id}", get(ws::pane_socket))
         .fallback(not_found)
         .layer(middleware::from_fn(cache_policy))
