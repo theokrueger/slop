@@ -1,0 +1,17 @@
+[Unit]
+Description=mmux web terminal multiplexer
+After=network-online.target
+
+[Service]
+Type=simple
+# Prepend Pi and user-local tools without replacing the inherited PATH.
+# $$ escapes systemd expansion so Bash can extend the value it receives.
+ExecStart=/bin/bash -lc 'export PATH="%h/.pi/agent/bin:%h/.local/share/pi-node/current/bin:%h/.local/bin:$$PATH"; exec %h/.cargo/bin/mmux'
+Environment=RUST_LOG=mmux=info
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

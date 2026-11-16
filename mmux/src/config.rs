@@ -298,6 +298,12 @@ mod tests {
     }
 
     #[test]
+    fn default_config_path_is_the_user_config_file() {
+        let path = Config::default_path().unwrap();
+        assert!(path.ends_with(Path::new(".config/mmux.toml")), "{path:?}");
+    }
+
+    #[test]
     fn empty_document_uses_defaults_except_required_new_project() {
         // `new_project` has a serde default, so an empty document is valid.
         let parsed = Config::from_toml("").expect("empty config is valid");

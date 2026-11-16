@@ -2,7 +2,7 @@ pub mod pane;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -94,12 +94,20 @@ pub struct SessionStore {
     events: broadcast::Sender<SessionEvent>,
     next_project: AtomicU64,
     next_pane: AtomicU64,
-    state_path: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    /// False after a failed load, so a partial or corrupt state is never
+    /// overwritten by a save based on an incomplete in-memory picture.
+    state_trusted: AtomicBool,
+    /// Records that failed to start. Keep them in the index so a later restart
+    /// can retry instead of losing the project definition.
+    unrestored: Mutex<Vec<ProjectRecord>>,
     persist_lock: Mutex<()>,
 }
 
 struct Project {
     id: ProjectId,
+    /// Stable identity for the project's persistence directory.
+    storage_id: Uuid,
     name: String,
     cwd: PathBuf,
     panes: Vec<Arc<Pane>>,
@@ -113,19 +121,19 @@ impl SessionStore {
         Self::build(template, default_size, None)
     }
 
-    /// Store that saves projects to `state_path` and can restore them.
-    pub fn with_state_file(
+    /// Store that saves projects under `state_dir` and can restore them.
+    pub fn with_state_dir(
         template: Vec<PaneConfig>,
         default_size: (u16, u16),
-        state_path: PathBuf,
+        state_dir: PathBuf,
     ) -> Self {
-        Self::build(template, default_size, Some(state_path))
+        Self::build(template, default_size, Some(state_dir))
     }
 
     fn build(
         template: Vec<PaneConfig>,
         default_size: (u16, u16),
-        state_path: Option<PathBuf>,
+        state_dir: Option<PathBuf>,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
@@ -136,7 +144,9 @@ impl SessionStore {
             events,
             next_project: AtomicU64::new(1),
             next_pane: AtomicU64::new(1),
-            state_path,
+            state_dir,
+            state_trusted: AtomicBool::new(true),
+            unrestored: Mutex::new(Vec::new()),
             persist_lock: Mutex::new(()),
         }
     }
@@ -153,30 +163,37 @@ impl SessionStore {
     /// Restores persisted projects before the server starts accepting clients.
     /// Returns the number of projects restored.
     pub async fn restore(&self) -> usize {
-        let Some(path) = self.state_path.as_ref() else {
+        let Some(state_dir) = self.state_dir.as_ref() else {
             return 0;
         };
-        let records = match persistence::load(path) {
+        let records = match persistence::load(state_dir) {
             Ok(records) => records,
             Err(err) => {
-                tracing::warn!(
+                self.state_trusted.store(false, Ordering::Relaxed);
+                tracing::error!(
                     error = %err,
-                    state = %path.display(),
-                    "could not restore projects; starting empty"
+                    state = %state_dir.display(),
+                    "could not restore projects; refusing to overwrite state"
                 );
                 return 0;
             }
         };
+        self.state_trusted.store(true, Ordering::Relaxed);
 
         let mut restored = 0;
         let mut needs_save = false;
         for record in records {
+            let retry = record.clone();
             match self.restore_project(record).await {
                 Ok(resolved_sessions) => {
                     restored += 1;
                     needs_save |= resolved_sessions;
                 }
-                Err(err) => tracing::warn!(error = %err, "could not restore saved project"),
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not restore saved project; keeping it");
+                    self.unrestored.lock().await.push(retry);
+                    needs_save = true;
+                }
             }
         }
         if needs_save {
@@ -185,7 +202,7 @@ impl SessionStore {
             self.persist().await;
         }
         if restored > 0 {
-            tracing::info!(restored, state = %path.display(), "restored projects");
+            tracing::info!(restored, state = %state_dir.display(), "restored projects");
         }
         restored
     }
@@ -200,7 +217,7 @@ impl SessionStore {
         };
         let panes = resolve_session_ids(&record.panes);
         let resolved_sessions = panes != record.panes;
-        self.spawn_project(name, cwd, &panes).await?;
+        self.spawn_project(record.id, name, cwd, &panes).await?;
         Ok(resolved_sessions)
     }
 
@@ -212,13 +229,16 @@ impl SessionStore {
     ) -> Result<ProjectView, SessionError> {
         let name = resolve_project_name(name, &cwd)?;
         let panes = resolve_session_ids(&self.template);
-        let view = self.spawn_project(name, cwd, &panes).await?;
+        let view = self
+            .spawn_project(Uuid::new_v4(), name, cwd, &panes)
+            .await?;
         self.persist().await;
         Ok(view)
     }
 
     async fn spawn_project(
         &self,
+        storage_id: Uuid,
         name: String,
         cwd: PathBuf,
         pane_configs: &[PaneConfig],
@@ -257,6 +277,7 @@ impl SessionStore {
 
         let project = Project {
             id: project_id,
+            storage_id,
             name,
             cwd,
             panes,
@@ -289,6 +310,41 @@ impl SessionStore {
         Ok(true)
     }
 
+    /// Reorders projects without restarting their panes. The order must be an
+    /// exact permutation of the open projects so stale requests cannot drop
+    /// projects created by another client.
+    pub async fn reorder_projects(&self, ids: &[ProjectId]) -> bool {
+        let mut projects = self.projects.write().await;
+        let valid = ids.len() == projects.len()
+            && ids.iter().enumerate().all(|(index, id)| {
+                !ids[..index].contains(id) && projects.iter().any(|project| project.id == *id)
+            });
+        if !valid {
+            return false;
+        }
+        if projects
+            .iter()
+            .map(|project| project.id)
+            .eq(ids.iter().copied())
+        {
+            return true;
+        }
+
+        let mut reordered = Vec::with_capacity(projects.len());
+        for id in ids {
+            let index = projects
+                .iter()
+                .position(|project| project.id == *id)
+                .expect("validated project order");
+            reordered.push(projects.remove(index));
+        }
+        *projects = reordered;
+        drop(projects);
+        self.broadcast();
+        self.persist().await;
+        true
+    }
+
     /// Closes a project and terminates all of its panes.
     pub async fn close_project(&self, id: ProjectId) -> bool {
         let removed = {
@@ -302,7 +358,24 @@ impl SessionStore {
             pane.terminate();
         }
         self.broadcast();
-        self.persist().await;
+        if self.persist().await
+            && let Some(state_dir) = self.state_dir.clone()
+        {
+            let storage_id = removed.storage_id;
+            let removed = tokio::task::spawn_blocking(move || {
+                persistence::delete_project(&state_dir, storage_id)
+            })
+            .await;
+            match removed {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "could not remove closed project directory");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "closed project cleanup task failed");
+                }
+            }
+        }
         true
     }
 
@@ -325,26 +398,38 @@ impl SessionStore {
     }
 
     /// Saves project definitions after a change. Errors are logged, not
-    /// propagated: losing durability must not break the live session.
-    async fn persist(&self) {
-        let Some(path) = self.state_path.as_ref() else {
-            return;
+    /// propagated: losing durability must not break the live session. Returns
+    /// whether the on-disk index now matches the live projects.
+    async fn persist(&self) -> bool {
+        let Some(state_dir) = self.state_dir.as_ref() else {
+            return false;
         };
-        let path = path.clone();
-        let path_display = path.display().to_string();
+        if !self.state_trusted.load(Ordering::Relaxed) {
+            tracing::warn!(
+                state = %state_dir.display(),
+                "skipping save because the saved state could not be loaded"
+            );
+            return false;
+        }
+        let state_dir = state_dir.clone();
+        let state_display = state_dir.display().to_string();
         let _guard = self.persist_lock.lock().await;
-        let records: Vec<ProjectRecord> = {
+        let mut records: Vec<ProjectRecord> = {
             let projects = self.projects.read().await;
             projects.iter().map(Project::record).collect()
         };
-        let result = tokio::task::spawn_blocking(move || persistence::save(&path, &records)).await;
+        records.extend(self.unrestored.lock().await.iter().cloned());
+        let result =
+            tokio::task::spawn_blocking(move || persistence::save(&state_dir, &records)).await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => true,
             Ok(Err(err)) => {
-                tracing::warn!(error = %err, state = %path_display, "could not save projects");
+                tracing::warn!(error = %err, state = %state_display, "could not save projects");
+                false
             }
             Err(err) => {
                 tracing::warn!(error = %err, "project persistence task failed");
+                false
             }
         }
     }
@@ -390,6 +475,7 @@ impl Project {
 
     fn record(&self) -> ProjectRecord {
         ProjectRecord {
+            id: self.storage_id,
             name: self.name.clone(),
             cwd: self.cwd.to_string_lossy().into_owned(),
             panes: self.pane_configs.clone(),
@@ -551,6 +637,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reorders_projects_and_persists_the_order() {
+        let root = tempfile::TempDir::new().unwrap();
+        let state = root.path().join("state");
+        let template = template(vec!["sleep", "30"]);
+        let store = SessionStore::with_state_dir(template.clone(), (24, 80), state.clone());
+        let first = store
+            .create_project(Some("first".into()), root.path().to_path_buf())
+            .await
+            .unwrap();
+        let second = store
+            .create_project(Some("second".into()), root.path().to_path_buf())
+            .await
+            .unwrap();
+        let third = store
+            .create_project(Some("third".into()), root.path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .reorder_projects(&[third.id, first.id, second.id])
+                .await
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .await
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            vec![third.id, first.id, second.id]
+        );
+        assert!(
+            !store
+                .reorder_projects(&[first.id, first.id, second.id])
+                .await
+        );
+        assert!(!store.reorder_projects(&[second.id, first.id]).await);
+        assert_eq!(persistence::load(&state).unwrap()[0].name, "third");
+        store.shutdown().await;
+
+        let restored = SessionStore::with_state_dir(template, (24, 80), state);
+        assert_eq!(restored.restore().await, 3);
+        assert_eq!(
+            restored
+                .snapshot()
+                .await
+                .iter()
+                .map(|project| project.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["third", "first", "second"]
+        );
+        restored.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_names() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = store(vec!["sleep", "10"]);
@@ -648,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn session_ids_persist_and_resume_across_restarts() {
         let root = tempfile::TempDir::new().unwrap();
-        let state = root.path().join("state/projects.json");
+        let state = root.path().join("state");
         let cwd = root.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
         let template = vec![PaneConfig {
@@ -663,7 +805,7 @@ mod tests {
             env: BTreeMap::new(),
         }];
 
-        let store = SessionStore::with_state_file(template.clone(), (24, 80), state.clone());
+        let store = SessionStore::with_state_dir(template.clone(), (24, 80), state.clone());
         let view = store.create_project(None, cwd.clone()).await.unwrap();
         let pane = store.pane(view.panes[0].id).await.unwrap();
         assert!(
@@ -685,7 +827,7 @@ mod tests {
             "resolved session id was not persisted"
         );
 
-        let restored = SessionStore::with_state_file(template, (24, 80), state);
+        let restored = SessionStore::with_state_dir(template, (24, 80), state);
         assert_eq!(restored.restore().await, 1);
         let view = restored.snapshot().await.remove(0);
         let pane = restored.pane(view.panes[0].id).await.unwrap();
@@ -708,21 +850,21 @@ mod tests {
     #[tokio::test]
     async fn persists_and_restores_projects_across_stores() {
         let root = tempfile::TempDir::new().unwrap();
-        let state = root.path().join("state/projects.json");
+        let state = root.path().join("state");
         let cwd = root.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
         let template = template(vec!["sh", "-c", "pwd; sleep 30"]);
 
-        let store = SessionStore::with_state_file(template.clone(), (24, 80), state.clone());
+        let store = SessionStore::with_state_dir(template.clone(), (24, 80), state.clone());
         let view = store
             .create_project(Some("api".into()), cwd.clone())
             .await
             .unwrap();
         store.rename_project(view.id, "api-work").await.unwrap();
-        assert!(state.is_file());
+        assert!(state.join("projects/index.json").is_file());
         store.shutdown().await;
 
-        let restored = SessionStore::with_state_file(template, (24, 80), state);
+        let restored = SessionStore::with_state_dir(template, (24, 80), state);
         assert_eq!(restored.restore().await, 1);
         let projects = restored.snapshot().await;
         assert_eq!(projects.len(), 1);
@@ -735,31 +877,104 @@ mod tests {
     #[tokio::test]
     async fn closing_a_project_persists_the_removal() {
         let root = tempfile::TempDir::new().unwrap();
-        let state = root.path().join("state/projects.json");
+        let state = root.path().join("state");
         let template = template(vec!["sleep", "30"]);
-        let store = SessionStore::with_state_file(template.clone(), (24, 80), state.clone());
+        let store = SessionStore::with_state_dir(template.clone(), (24, 80), state.clone());
         let view = store
             .create_project(None, root.path().to_path_buf())
             .await
             .unwrap();
+        let storage_id = persistence::load(&state).unwrap()[0].id;
+        let project_dir = persistence::project_dir(&state, storage_id);
+        assert!(project_dir.is_dir());
         store.close_project(view.id).await;
+        assert!(!project_dir.exists(), "closed project directory was kept");
         store.shutdown().await;
 
-        let restored = SessionStore::with_state_file(template, (24, 80), state);
+        let restored = SessionStore::with_state_dir(template, (24, 80), state);
         assert_eq!(restored.restore().await, 0);
         assert!(restored.snapshot().await.is_empty());
         restored.shutdown().await;
     }
 
     #[tokio::test]
-    async fn corrupt_state_starts_with_no_projects() {
+    async fn corrupt_state_starts_with_no_projects_and_is_not_overwritten() {
         let root = tempfile::TempDir::new().unwrap();
-        let state = root.path().join("projects.json");
-        std::fs::write(&state, "not json").unwrap();
-        let store = SessionStore::with_state_file(template(vec!["sleep", "10"]), (24, 80), state);
+        let state = root.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("projects.json"), "not json").unwrap();
+        let store =
+            SessionStore::with_state_dir(template(vec!["sleep", "10"]), (24, 80), state.clone());
         assert_eq!(store.restore().await, 0);
         assert!(store.snapshot().await.is_empty());
         store.shutdown().await;
+        assert!(!state.join("projects/index.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(state.join("projects.json")).unwrap(),
+            "not json"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_failure_does_not_delete_or_rewrite_existing_projects() {
+        let root = tempfile::TempDir::new().unwrap();
+        let state = root.path().join("state");
+        let panes = template(vec!["sleep", "10"]);
+        let records = vec![
+            ProjectRecord {
+                id: Uuid::new_v4(),
+                name: "first".into(),
+                cwd: root.path().to_string_lossy().into_owned(),
+                panes: panes.clone(),
+            },
+            ProjectRecord {
+                id: Uuid::new_v4(),
+                name: "second".into(),
+                cwd: root.path().to_string_lossy().into_owned(),
+                panes,
+            },
+        ];
+        persistence::save(&state, &records).unwrap();
+        let index_path = state.join("projects/index.json");
+        let index_before = std::fs::read_to_string(&index_path).unwrap();
+        std::fs::write(
+            persistence::project_dir(&state, records[1].id).join("project.json"),
+            "not json",
+        )
+        .unwrap();
+
+        let store =
+            SessionStore::with_state_dir(template(vec!["sleep", "10"]), (24, 80), state.clone());
+        assert_eq!(store.restore().await, 0);
+        store.shutdown().await;
+
+        for record in &records {
+            assert!(persistence::project_dir(&state, record.id).is_dir());
+        }
+        assert_eq!(std::fs::read_to_string(index_path).unwrap(), index_before);
+    }
+
+    #[tokio::test]
+    async fn records_that_fail_to_restore_stay_in_the_index() {
+        let root = tempfile::TempDir::new().unwrap();
+        let state = root.path().join("state");
+        let store =
+            SessionStore::with_state_dir(template(vec!["sleep", "10"]), (24, 80), state.clone());
+        let retained = ProjectRecord {
+            id: Uuid::new_v4(),
+            name: "broken".into(),
+            cwd: root.path().to_string_lossy().into_owned(),
+            panes: Vec::new(),
+        };
+        store.unrestored.lock().await.push(retained.clone());
+        store.persist().await;
+        store.shutdown().await;
+
+        let records = persistence::load(&state).unwrap();
+        assert!(
+            records.iter().any(|record| record.id == retained.id),
+            "failed project was dropped from the index"
+        );
     }
 
     #[test]

@@ -22,6 +22,17 @@ directory). Validate a config without starting the server:
 rpanel --check --config ./rpanel.example.yaml
 ```
 
+To serve on a privileged port as a user, the binary needs the
+`cap_net_bind_service` file capability. Use the install script, which installs
+the binary, applies the capability, and restarts the user unit:
+
+```sh
+./install.sh
+```
+
+`cargo install` on its own replaces the binary and drops the capability, so a
+unit that binds port 443 will then fail with "Permission denied".
+
 ## Configuration
 
 See [`rpanel.example.yaml`](rpanel.example.yaml) for a complete example.
@@ -49,6 +60,7 @@ See [`rpanel.example.yaml`](rpanel.example.yaml) for a complete example.
 | `status.uptime` | `true` | System uptime. |
 | `status.network` | `true` | Current speed and throughput windows. |
 | `status.status` | `[]` | systemd units to report. |
+| `network_state` | state dir | File that keeps the network history across restarts. |
 | `links` | `{}` | Display name -> URL, rendered in order. |
 
 `status.status` entries are either a unit name (`tary`) or a mapping for a user
@@ -63,8 +75,12 @@ status:
 
 Network counters are sampled every 10 seconds. The panel shows the current
 upload/download speed for "Now", and the total bytes transferred for the last
-5 minutes, hour, day, month, and since rpanel started. Loopback interfaces are
-excluded.
+5 minutes, hour, day, month, and all time. Loopback interfaces are excluded.
+
+The history is written to `panel.network_state` (by default
+`~/.local/state/rpanel/network.yaml`, or the platform state directory) every
+minute and on shutdown, so the windows and the all-time total survive restarts
+and reboots. Set `network_state` to override the location.
 
 ### `groups`
 

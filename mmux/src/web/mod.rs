@@ -105,6 +105,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(api::events))
         .route("/api/fs", get(api::list_directory))
         .route("/api/projects", post(api::create_project))
+        .route("/api/projects/reorder", post(api::reorder_projects))
         .route(
             "/api/projects/{id}",
             patch(api::rename_project).delete(api::close_project),

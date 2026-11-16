@@ -1,4 +1,4 @@
-use std::{fmt::Write, sync::Arc, time::Instant};
+use std::{fmt::Write, sync::Arc};
 
 use axum::{
     extract::State,
@@ -7,7 +7,7 @@ use axum::{
 };
 
 use crate::{
-    config::{PanelConfig, StatusConfig},
+    config::PanelConfig,
     net::Snapshot,
     state::AppState,
     status::{self, RamInfo, ServiceStatus, StorageInfo, SystemStatus},
@@ -18,7 +18,7 @@ pub async fn handler(State(state): State<Arc<AppState>>) -> Response {
         return (StatusCode::INTERNAL_SERVER_ERROR, "panel unavailable\n").into_response();
     };
     let status = status::collect(&panel.config.status).await;
-    let stats = panel.network.snapshot(Instant::now());
+    let stats = panel.network.snapshot();
     let mut response = Html(render(&panel.config, &status, &stats)).into_response();
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -40,7 +40,11 @@ pub async fn handler(State(state): State<Arc<AppState>>) -> Response {
 }
 
 fn render(config: &PanelConfig, status: &SystemStatus, stats: &Snapshot) -> String {
-    let show_status = has_status(&config.status);
+    // Uptime and services sit under the links; memory, storage and network
+    // form the side column.
+    let below = config.status.uptime || !config.status.status.is_empty();
+    let side = config.status.ram || config.status.storage || config.status.network;
+    let show_status = below || side;
     let refresh = if config.refresh_seconds > 0 && show_status {
         format!(
             r#"<meta http-equiv="refresh" content="{}">"#,
@@ -65,13 +69,9 @@ fn render(config: &PanelConfig, status: &SystemStatus, stats: &Snapshot) -> Stri
 <body>
 <main class="{}">
 <section class="links">
-<header>
-<h1>rpanel</h1>
-<p class="muted">Reverse proxy panel</p>
-</header>
 <nav>
 "#,
-        if show_status { "" } else { "single" }
+        if side { "" } else { "single" }
     );
 
     if config.links.is_empty() {
@@ -87,13 +87,23 @@ fn render(config: &PanelConfig, status: &SystemStatus, stats: &Snapshot) -> Stri
         }
     }
 
-    html.push_str("</nav>\n</section>\n");
+    html.push_str("</nav>\n");
 
-    if show_status {
-        html.push_str(r#"<aside class="status">"#);
+    if below {
+        html.push_str(r#"<div class="panes">"#);
         if config.status.uptime {
             render_uptime(&mut html, status.uptime);
         }
+        if !config.status.status.is_empty() {
+            render_services(&mut html, &status.services);
+        }
+        html.push_str("</div>\n");
+    }
+
+    html.push_str("</section>\n");
+
+    if side {
+        html.push_str(r#"<aside class="status">"#);
         if config.status.ram {
             render_ram(&mut html, status.ram.as_ref());
         }
@@ -103,18 +113,11 @@ fn render(config: &PanelConfig, status: &SystemStatus, stats: &Snapshot) -> Stri
         if config.status.network {
             render_network(&mut html, stats);
         }
-        if !config.status.status.is_empty() {
-            render_services(&mut html, &status.services);
-        }
         html.push_str("</aside>\n");
     }
 
-    html.push_str("</main>\n<footer>rpanel</footer>\n</body>\n</html>\n");
+    html.push_str("</main>\n</body>\n</html>\n");
     html
-}
-
-fn has_status(config: &StatusConfig) -> bool {
-    config.storage || config.ram || config.uptime || config.network || !config.status.is_empty()
 }
 
 fn render_uptime(html: &mut String, uptime: Option<u64>) {
@@ -316,31 +319,33 @@ fn bar(used: u64, total: u64) -> String {
 }
 
 const CSS: &str = r#"
+/* Solarized, matching mmux: base03/base02/base2 for dark, base3/base2 for
+   light, magenta as the accent. */
 :root {
   color-scheme: light dark;
-  --bg: #f6f7f9;
-  --fg: #1b1f24;
-  --muted: #667085;
-  --card: #ffffff;
-  --border: #e4e7ec;
-  --accent: #2563eb;
-  --ok: #16a34a;
-  --bad: #dc2626;
-  --idle: #d97706;
-  --bar: #e9edf2;
+  --bg: #fdf6e3;
+  --fg: #586e75;
+  --muted: #93a1a1;
+  --card: #eee8d5;
+  --border: #d9d2bf;
+  --accent: #d33682;
+  --ok: #859900;
+  --bad: #dc322f;
+  --idle: #b58900;
+  --bar: #e7e0cd;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0f1115;
-    --fg: #e6e8eb;
-    --muted: #98a2b3;
-    --card: #171a21;
-    --border: #262b35;
-    --accent: #60a5fa;
-    --ok: #4ade80;
-    --bad: #f87171;
-    --idle: #fbbf24;
-    --bar: #232833;
+    --bg: #002b36;
+    --fg: #eee8d5;
+    --muted: #586e75;
+    --card: #073642;
+    --border: #14505c;
+    --accent: #d33682;
+    --ok: #859900;
+    --bad: #dc322f;
+    --idle: #b58900;
+    --bar: #0b3a46;
   }
 }
 * { box-sizing: border-box; }
@@ -348,11 +353,12 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system
 main { max-width: 1100px; margin: 0 auto; padding: 40px 20px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 24px; align-items: start; }
 main.single { grid-template-columns: 1fr; }
 @media (max-width: 800px) { main { grid-template-columns: 1fr; padding: 24px 16px; } }
-h1 { font-size: 1.6rem; margin: 0 0 4px; letter-spacing: -0.02em; }
 h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 14px; }
 p { margin: 0; }
 .muted { color: var(--muted); }
-.links nav { display: grid; gap: 10px; margin-top: 24px; }
+.links nav { display: grid; gap: 10px; }
+.links .panes { display: grid; gap: 16px; margin-top: 16px; }
+main.single .panes { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
 .link { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; color: inherit; text-decoration: none; transition: border-color .15s, transform .15s; }
 .link:hover { border-color: var(--accent); transform: translateY(-1px); }
 .arrow { color: var(--muted); }
@@ -378,7 +384,6 @@ tbody th { font-weight: 500; color: var(--muted); }
 .badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; background: var(--bar); color: var(--muted); }
 .badge.ok { color: var(--ok); }
 .badge.bad { color: var(--bad); }
-footer { max-width: 1100px; margin: 0 auto; padding: 0 20px 32px; color: var(--muted); font-size: 0.8rem; }
 "#;
 
 #[cfg(test)]
@@ -387,7 +392,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::Service,
+        config::{Service, StatusConfig},
         net::{Rate, Transfer},
         status::{RamInfo, ServiceStatus, StorageInfo},
     };
@@ -403,6 +408,7 @@ mod tests {
                 network: true,
                 status: vec![Service::System("tary".into())],
             },
+            network_state: None,
             links: IndexMap::from([
                 ("Tary".to_string(), "/tary".to_string()),
                 ("Name".to_string(), "/name".to_string()),

@@ -62,10 +62,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
         PamAuthenticator::new(config.auth.pam_service.clone(), user.clone())
             .context("could not configure PAM")?,
     );
-    let state_path = persistence::default_state_path();
+    let state_dir = persistence::default_state_dir();
     let sessions = Arc::new(
-        match state_path.as_ref() {
-            Some(path) => SessionStore::with_state_file(
+        match state_dir.as_ref() {
+            Some(path) => SessionStore::with_state_dir(
                 config.new_project.panes.clone(),
                 (config.terminal.rows, config.terminal.cols),
                 path.clone(),
@@ -80,7 +80,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         }
         .with_appearance(config.terminal.appearance),
     );
-    if let Some(path) = state_path.as_ref() {
+    if let Some(path) = state_dir.as_ref() {
         tracing::info!(state = %path.display(), "project persistence enabled");
     }
     sessions.restore().await;

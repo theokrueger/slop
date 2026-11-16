@@ -237,6 +237,7 @@ async fn login_sets_an_http_only_strict_session_cookie() {
     assert_eq!(status, StatusCode::OK);
     let index_html = String::from_utf8_lossy(&body);
     assert!(index_html.contains("new project"));
+    assert!(!index_html.contains(r#"<div class="brand">mmux</div>"#));
     // Relative asset URLs keep the app working behind a path prefix.
     assert!(index_html.contains(r#"src="assets/app.js""#));
     assert!(!index_html.contains(r#"src="/assets/"#));
@@ -427,6 +428,58 @@ async fn projects_are_created_in_the_chosen_directory_and_can_be_renamed_and_clo
         ))
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn projects_can_be_reordered_without_accepting_stale_orders() {
+    let app = TestApp::new(TestApp::default_template());
+    let cookie = app.login().await;
+    let mut project_ids = Vec::new();
+    for (name, directory) in [("first", "alpha"), ("second", "beta")] {
+        let (status, _, body) = app
+            .call(json_request(
+                Method::POST,
+                "/api/projects",
+                json!({ "name": name, "cwd": app.root.path().join(directory) }),
+                &[(header::COOKIE.as_str(), &cookie)],
+                true,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let project: Value = serde_json::from_slice(&body).unwrap();
+        project_ids.push(project["id"].as_u64().unwrap());
+    }
+
+    let reordered = json!({ "project_ids": [project_ids[1], project_ids[0]] });
+    let (status, _, body) = app
+        .call(json_request(
+            Method::POST,
+            "/api/projects/reorder",
+            reordered,
+            &[(header::COOKIE.as_str(), &cookie)],
+            true,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let projects = app.state(&cookie).await;
+    assert_eq!(projects["projects"][0]["name"], "second");
+    assert_eq!(projects["projects"][1]["name"], "first");
+
+    let (status, _, _) = app
+        .call(json_request(
+            Method::POST,
+            "/api/projects/reorder",
+            json!({ "project_ids": [project_ids[1], project_ids[1]] }),
+            &[(header::COOKIE.as_str(), &cookie)],
+            true,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let projects = app.state(&cookie).await;
+    assert_eq!(projects["projects"][0]["name"], "second");
+    assert_eq!(projects["projects"][1]["name"], "first");
 
     app.shutdown().await;
 }

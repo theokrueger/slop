@@ -32,7 +32,7 @@ tower-sessions = { version = "0.15", features = ["memory-store"] }
 tower_governor = { version = "0.8", default-features = false, features = ["axum"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.18", features = ["v4"] }
+uuid = { version = "1.18", features = ["v4", "serde"] }
 vt100 = "0.18"
 
 [dev-dependencies]

@@ -61,6 +61,8 @@
     handles: new Map(),
     renderedProjectKey: null,
     editingProjectId: null,
+    draggedProjectId: null,
+    projectDropTarget: null,
     refreshTimer: null,
     refreshing: false,
     pendingRefresh: false,
@@ -319,7 +321,8 @@
       const item = document.createElement("div");
       item.className = "project" + (project.id === state.activeProjectId ? " active" : "");
       item.tabIndex = 0;
-      item.title = `${project.cwd}\nDouble-click to rename`;
+      item.dataset.projectId = String(project.id);
+      item.title = `${project.cwd}\nDrag to reorder\nDouble-click to rename`;
 
       if (state.editingProjectId === project.id) {
         const input = document.createElement("input");
@@ -396,7 +399,95 @@
         });
       }
 
+      if (state.editingProjectId !== project.id) {
+        item.draggable = true;
+        item.addEventListener("dragstart", (event) => {
+          state.draggedProjectId = project.id;
+          updateProjectDragIndicator();
+          if (event.dataTransfer) {
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", String(project.id));
+          }
+        });
+        item.addEventListener("dragend", finishProjectDrag);
+        item.addEventListener("dragover", (event) => {
+          if (state.draggedProjectId === null) return;
+          event.preventDefault();
+          event.stopPropagation();
+          const rect = item.getBoundingClientRect();
+          state.projectDropTarget = {
+            id: project.id,
+            before: event.clientY < rect.top + rect.height / 2,
+          };
+          if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+          updateProjectDragIndicator();
+        });
+        item.addEventListener("drop", (event) => {
+          if (state.draggedProjectId === null) return;
+          event.preventDefault();
+          event.stopPropagation();
+          const draggedId = state.draggedProjectId;
+          const rect = item.getBoundingClientRect();
+          const before = event.clientY < rect.top + rect.height / 2;
+          finishProjectDrag();
+          void reorderProject(draggedId, project.id, before);
+        });
+      }
+
       els.projects.append(item);
+    }
+    updateProjectDragIndicator();
+  }
+
+  function updateProjectDragIndicator() {
+    const target = state.projectDropTarget;
+    for (const item of els.projects.children) {
+      const id = Number(item.dataset.projectId);
+      item.classList.toggle("dragging", id === state.draggedProjectId);
+      item.classList.toggle("drop-before", target?.id === id && target.before);
+      item.classList.toggle("drop-after", target?.id === id && !target.before);
+    }
+    els.projects.classList.toggle("drop-at-end", target?.atEnd === true);
+  }
+
+  function finishProjectDrag() {
+    state.draggedProjectId = null;
+    state.projectDropTarget = null;
+    updateProjectDragIndicator();
+  }
+
+  async function reorderProject(draggedId, targetId, before) {
+    if (draggedId === targetId) return;
+    const previousProjects = state.projects;
+    if (!previousProjects.some((project) => project.id === draggedId)) return;
+
+    const reorderedProjects = previousProjects.filter((project) => project.id !== draggedId);
+    let insertionIndex = reorderedProjects.length;
+    if (targetId !== null) {
+      const targetIndex = reorderedProjects.findIndex((project) => project.id === targetId);
+      if (targetIndex < 0) return;
+      insertionIndex = targetIndex + (before ? 0 : 1);
+    }
+    const dragged = previousProjects.find((project) => project.id === draggedId);
+    reorderedProjects.splice(insertionIndex, 0, dragged);
+    if (reorderedProjects.every((project, index) => project === previousProjects[index])) return;
+
+    state.projects = reorderedProjects;
+    renderProjects();
+    try {
+      await api("api/projects/reorder", {
+        method: "POST",
+        mutation: true,
+        body: { project_ids: reorderedProjects.map((project) => project.id) },
+      });
+    } catch (error) {
+      if (state.projects === reorderedProjects) {
+        state.projects = previousProjects;
+        renderProjects();
+      }
+      if (error.message !== "unauthorized") window.alert(error.message);
+    } finally {
+      scheduleRefresh(0);
     }
   }
 
@@ -870,6 +961,22 @@
     if (!ok && target !== state.root) await loadDir(state.root);
     els.projectName.focus();
   }
+
+  els.projects.addEventListener("dragover", (event) => {
+    if (state.draggedProjectId === null || event.target !== els.projects) return;
+    event.preventDefault();
+    state.projectDropTarget = { atEnd: true };
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    updateProjectDragIndicator();
+  });
+  els.projects.addEventListener("drop", (event) => {
+    if (state.draggedProjectId === null || event.target !== els.projects) return;
+    event.preventDefault();
+    const draggedId = state.draggedProjectId;
+    finishProjectDrag();
+    void reorderProject(draggedId, null, false);
+  });
+  els.projects.addEventListener("dragend", finishProjectDrag);
 
   els.newProject.addEventListener("click", openNewProject);
   els.emptyNewProject.addEventListener("click", openNewProject);

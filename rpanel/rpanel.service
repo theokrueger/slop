@@ -1,0 +1,17 @@
+[Unit]
+Description=rpanel reverse proxy and status panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.cargo/bin/rpanel --config %h/.config/rpanel.yaml
+Restart=on-failure
+RestartSec=5
+UMask=0077
+# Do not set NoNewPrivileges: the binary relies on the
+# cap_net_bind_service file capability to bind port 443.
+
+[Install]
+WantedBy=default.target

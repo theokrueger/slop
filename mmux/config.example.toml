@@ -33,9 +33,9 @@ cols = 100
 appearance = "dark"
 
 # Every new project starts this set of panes, in the directory chosen in the
-# browser. Projects are created on demand and persisted under
-# $XDG_STATE_HOME/mmux/projects.json; on restart they are restored with fresh
-# panes in their saved working directories.
+# browser. Projects are created on demand and persisted in per-project
+# directories under $XDG_STATE_HOME/mmux/projects/; on restart they are
+# restored with fresh panes in their saved working directories.
 #
 # `{session_id}` is replaced once per pane with a UUID when the project is
 # created, and the resolved command is saved with the project. The default pi

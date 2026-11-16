@@ -64,6 +64,9 @@ pub struct PanelConfig {
     pub refresh_seconds: u64,
     #[serde(default)]
     pub status: StatusConfig,
+    /// File that stores the network history across restarts. Defaults to the
+    /// platform state directory (`~/.local/state/rpanel/network.yaml`).
+    pub network_state: Option<PathBuf>,
     /// Display name -> URL, rendered in configuration order.
     #[serde(default)]
     pub links: IndexMap<String, String>,
@@ -75,6 +78,7 @@ impl Default for PanelConfig {
             enable: true,
             refresh_seconds: default_refresh(),
             status: StatusConfig::default(),
+            network_state: None,
             links: IndexMap::new(),
         }
     }

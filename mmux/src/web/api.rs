@@ -166,6 +166,26 @@ pub async fn create_project(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ReorderProjectsRequest {
+    pub project_ids: Vec<ProjectId>,
+}
+
+pub async fn reorder_projects(
+    State(state): State<AppState>,
+    AuthUser(_user): AuthUser,
+    headers: HeaderMap,
+    Json(request): Json<ReorderProjectsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_mutation(&headers)?;
+    if !state.sessions.reorder_projects(&request.project_ids).await {
+        return Err(ApiError::bad_request(
+            "project order does not match the open projects",
+        ));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RenameProjectRequest {
     pub name: String,
 }

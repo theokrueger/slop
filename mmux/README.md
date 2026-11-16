@@ -7,8 +7,8 @@ running inside it. Several browsers can attach to the same session and share
 the same panes.
 
 - Four-slot pane grid: **top-left**, **top-right**, **bottom-left**, **bottom-right**
-- Vertical project list; projects can be created, renamed (double-click), and
-  closed
+- Vertical project list; projects can be created, renamed (double-click),
+  reordered by dragging, and closed
 - A new project starts the configured pane template in a working directory
   chosen through an interactive directory picker
 - No projects are open on a fresh install
@@ -75,13 +75,23 @@ Configuration is read from `~/.config/mmux.toml` by default.
 ## Projects and persistence
 
 The vertical list contains **projects**. Each project owns up to four panes
-and a working directory. Projects are durable: after creation, rename, close,
-and shutdown, mmux writes their names, working directories, and pane
-definitions to:
+and a working directory. Drag projects to reorder them. Projects are durable:
+after creation, rename, reorder, close, and shutdown, mmux writes their order,
+names, working directories, and pane definitions to a directory per project:
 
 ```text
-$XDG_STATE_HOME/mmux/projects.json
+$XDG_STATE_HOME/mmux/
+  projects/
+    index.json              # project IDs in sidebar order
+    <project-id>/
+      project.json          # name, working directory, pane definitions
 ```
+
+Each project keeps a stable ID across renames, reorders, and restarts, so
+future per-project state can live beside its `project.json`. An older
+`$XDG_STATE_HOME/mmux/projects.json` is migrated automatically on first start
+and kept as `projects.json.migrated` (or a numbered variant if that name is
+already in use).
 
 On the next start, mmux restores those projects and starts fresh panes in their
 saved working directories. Running processes cannot be serialized, so agents
@@ -94,7 +104,8 @@ resume them manually with `pi --resume` or recreate the project. If a saved
 directory or command no longer exists, the project is still restored and the
 affected pane reports the startup error and keeps retrying.
 
-Delete the state file to start with no projects.
+Delete the whole `$XDG_STATE_HOME/mmux` directory to start with no projects.
+mmux refuses to overwrite saved state that it could not fully load.
 
 ## How sessions behave
 

@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
 
     let routes = Arc::new(build_routes(&config.groups));
     let client = build_client(config.server.allow_insecure_upstream)?;
-    let network = Arc::new(NetworkHistory::new(RETENTION));
+    let network = Arc::new(network_history(&config));
 
     if config.panel.enable && config.panel.status.network {
         spawn_sampler(network.clone(), Duration::from_secs(10));
@@ -122,6 +122,9 @@ async fn main() -> Result<()> {
             .await?;
     }
 
+    // Persist the last few samples collected before shutting down.
+    rpanel::net::save(&network);
+
     Ok(())
 }
 
@@ -129,6 +132,24 @@ fn default_config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("rpanel.yaml")
+}
+
+fn default_state_path() -> PathBuf {
+    dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("rpanel")
+        .join("network.yaml")
+}
+
+fn network_history(config: &Config) -> NetworkHistory {
+    match &config.panel.network_state {
+        Some(path) => NetworkHistory::with_state(RETENTION, path.clone()),
+        None if config.panel.enable && config.panel.status.network => {
+            NetworkHistory::with_state(RETENTION, default_state_path())
+        }
+        None => NetworkHistory::new(RETENTION),
+    }
 }
 
 fn init_logging(server: &ServerConfig) -> Result<Option<WorkerGuard>> {

@@ -31,6 +31,9 @@ panel:
   links:
     Tary: "/tary/"
     Name: "/name/"
+  # Where the network history is persisted. Defaults to the platform state
+  # directory (~/.local/state/rpanel/network.yaml).
+  # network_state: "/home/me/.local/state/rpanel/network.yaml"
 
 groups:
   "Name":
