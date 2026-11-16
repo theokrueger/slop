@@ -691,6 +691,9 @@
     };
 
     const sendFrame = (opcode, bytes) => {
+      window.recordKeyDebug?.(
+        `send ${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(" ")}`,
+      );
       if (!handle.ws || handle.ws.readyState !== WebSocket.OPEN) return;
       const frame = new Uint8Array(1 + bytes.length);
       frame[0] = opcode;
@@ -748,6 +751,14 @@
         event.preventDefault();
         event.stopPropagation();
         focusPaneInDirection(handle, direction);
+        return false;
+      }
+
+      const meta = metaChord(event);
+      if (meta !== null) {
+        event.preventDefault();
+        event.stopPropagation();
+        sendFrame(CLIENT_INPUT, encoder.encode(meta));
         return false;
       }
 
@@ -940,6 +951,44 @@
     if (event.code === "Slash" && event.shiftKey) return 0x7f;
     const letter = /^Key([A-Z])$/.exec(event.code);
     if (letter) return letter[1].charCodeAt(0) - 64;
+    return null;
+  }
+
+  // Some Firefox builds deliver an Alt chord with the modifier already cleared,
+  // so `event.altKey` is false even though Alt is physically down. Track the
+  // key itself; a stuck flag is bounded because the release, window blur and
+  // tab switch all clear it.
+  let altDown = false;
+  const trackAlt = (event) => {
+    if (event.key === "Alt") altDown = event.type === "keydown";
+  };
+  document.addEventListener("keydown", trackAlt, true);
+  document.addEventListener("keyup", trackAlt, true);
+  window.addEventListener("blur", () => {
+    altDown = false;
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) altDown = false;
+  });
+
+  // Meta chords with a printable key are encoded here instead of by xterm.
+  // Firefox hands Alt+<letter> over with no usable keyCode (its menu access-key
+  // handling), so xterm maps the keydown to nothing and the browser's keypress
+  // then types the bare character into the pane: M-x arrives as "x". Sending
+  // ESC+key ourselves and swallowing the event keeps that keypress from
+  // happening. Non-printable keys (arrows, Backspace, Enter, ...) keep xterm's
+  // own mappings, which do work.
+  function metaChord(event) {
+    if (APPLE || event.ctrlKey || event.metaKey) return null;
+    if (!event.altKey && !altDown) return null;
+    if (event.getModifierState && event.getModifierState("AltGraph")) return null;
+    if (event.key.length === 1) return `\x1b${event.key}`;
+    // Composing layouts report the chord as a dead key; fall back to the
+    // physical key so Alt+letter still reaches the program.
+    const key = /^Key([A-Z])$/.exec(event.code);
+    if (event.key === "Dead" && key) {
+      return `\x1b${event.shiftKey ? key[1] : key[1].toLowerCase()}`;
+    }
     return null;
   }
 
@@ -2036,6 +2085,29 @@
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && state.events) scheduleRefresh(0);
   });
+
+  // `?keys=1` overlays the raw key events and the bytes they produce. Browsers
+  // sometimes swallow modifier chords before the page sees them, which is
+  // invisible from the pane; this makes the difference readable on screen.
+  if (new URLSearchParams(window.location.search).get("keys") === "1") {
+    const hud = document.createElement("pre");
+    hud.className = "key-hud";
+    document.body.append(hud);
+    const lines = [];
+    window.recordKeyDebug = (line) => {
+      lines.push(line);
+      if (lines.length > 14) lines.shift();
+      hud.textContent = lines.join("\n");
+    };
+    const record = (event) => {
+      window.recordKeyDebug(
+        `${event.type} key=${event.key} code=${event.code} alt=${event.altKey}`
+          + ` ctrl=${event.ctrlKey} keyCode=${event.keyCode}`,
+      );
+    };
+    document.addEventListener("keydown", record, true);
+    document.addEventListener("keyup", record, true);
+  }
 
   refresh();
   // Two small eager fetches, both needed for the sidebar badges and warning
