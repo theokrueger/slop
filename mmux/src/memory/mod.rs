@@ -10,6 +10,7 @@ pub mod ops;
 pub mod readiness;
 pub mod search;
 pub mod vault;
+pub mod watch;
 
 pub use crate::config::MemoryConfig;
 pub use doc::{Doc, DocKind, DocSource, DocSummary};
@@ -35,6 +36,12 @@ pub enum MemoryError {
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
+
+impl From<std::io::Error> for MemoryError {
+    fn from(err: std::io::Error) -> Self {
+        MemoryError::Other(err.into())
+    }
+}
 
 impl Memory {
     /// Loads a document, reporting a missing file as [`MemoryError::NotFound`]

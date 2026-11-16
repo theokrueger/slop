@@ -5,7 +5,7 @@ pub mod ws;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use axum::extract::{FromRequestParts, Path, Request};
+use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -25,6 +25,7 @@ use crate::auth::Authenticator;
 use crate::config::Config;
 use crate::memory::{Memory, MemoryReadiness};
 use crate::session::SessionStore;
+use crate::theme::Appearance;
 use crate::workspace::Workspace;
 
 pub const SESSION_USER: &str = "user";
@@ -112,6 +113,7 @@ pub fn router(state: AppState) -> Router {
         .route("/logout", post(logout))
         .route("/healthz", get(health))
         .route("/api/theme", get(api::theme))
+        .route("/assets/favicon.svg", get(favicon))
         .route("/assets/{*path}", get(asset))
         .route("/api/state", get(api::state))
         .route("/api/events", get(api::events))
@@ -134,6 +136,15 @@ pub fn router(state: AppState) -> Router {
                 .delete(api::memory_doc_delete),
         )
         .route("/api/memory/search", get(api::memory_search))
+        .route("/api/memory/archive", get(api::memory_archive))
+        .route(
+            "/api/memory/archive/{id}",
+            get(api::memory_archive_read).delete(api::memory_archive_purge),
+        )
+        .route(
+            "/api/memory/archive/{id}/restore",
+            post(api::memory_archive_restore),
+        )
         .route("/api/archive", get(api::archive_list))
         .route("/api/archive/{id}/restore", post(api::archive_restore))
         .route("/api/archive/{id}", delete(api::archive_delete))
@@ -277,6 +288,49 @@ async fn health() -> &'static str {
 
 async fn asset(Path(path): Path<String>) -> Response {
     assets::serve(&path)
+}
+
+/// The favicon follows the configured appearance, not the browser preference:
+/// mmux fixes one Solarized palette for its terminals and UI.
+const FAVICON_DARK: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="6" fill="#002b36"/>
+  <rect x="6" y="6" width="9" height="9" rx="1.5" fill="#93a1a1"/>
+  <rect x="17" y="6" width="9" height="9" rx="1.5" fill="#93a1a1" opacity=".7"/>
+  <rect x="6" y="17" width="9" height="9" rx="1.5" fill="#93a1a1" opacity=".7"/>
+  <rect x="17" y="17" width="9" height="9" rx="1.5" fill="#d33682"/>
+</svg>
+"##;
+
+const FAVICON_LIGHT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="6" fill="#fdf6e3"/>
+  <rect x="6" y="6" width="9" height="9" rx="1.5" fill="#586e75"/>
+  <rect x="17" y="6" width="9" height="9" rx="1.5" fill="#586e75" opacity=".7"/>
+  <rect x="6" y="17" width="9" height="9" rx="1.5" fill="#586e75" opacity=".7"/>
+  <rect x="17" y="17" width="9" height="9" rx="1.5" fill="#d33682"/>
+</svg>
+"##;
+
+async fn favicon(State(state): State<AppState>) -> Response {
+    let body = match state.config.terminal.appearance {
+        Appearance::Dark => FAVICON_DARK,
+        Appearance::Light => FAVICON_LIGHT,
+    };
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("image/svg+xml"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                // Appearance changes only with a config edit and a restart, but
+                // revalidating keeps the icon in step immediately after that.
+                HeaderValue::from_static("no-cache"),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 async fn not_found() -> StatusCode {

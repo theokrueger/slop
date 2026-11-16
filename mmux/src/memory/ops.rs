@@ -1,11 +1,13 @@
 //! The operation layer shared by the CLI, the HTTP API, and the MCP server.
 //! Every mutation is an explicit call; nothing here runs on a timer.
 
+use std::fs;
+
 use serde::Serialize;
 
 use super::doc::{Doc, DocKind, DocSource, now, slugify};
 use super::search::{Query, score};
-use super::vault::{Memory, Workspace};
+use super::vault::{Memory, Workspace, create_private_dir};
 use super::{MemoryError, Result};
 
 /// A document to create.
@@ -54,6 +56,25 @@ pub struct Hit {
     pub score: i64,
     pub workspace_key: String,
     pub workspace_path: String,
+}
+
+/// A deleted document, as listed in the web UI's archive.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchivedSummary {
+    pub id: String,
+    pub slug: String,
+    pub title: String,
+    pub kind: DocKind,
+    pub archived_at: String,
+}
+
+/// A deleted document with its body, for viewing or restoring.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchivedDoc {
+    pub id: String,
+    pub archived_at: String,
+    #[serde(flatten)]
+    pub doc: Doc,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -140,9 +161,113 @@ impl Memory {
         self.store(workspace, doc).map_err(MemoryError::Other)
     }
 
-    pub fn remove(&self, workspace: &Workspace, slug: &str) -> Result<()> {
-        self.read(workspace, slug)?;
-        self.delete(workspace, slug).map_err(MemoryError::Other)
+    /// Deletes a document by moving it to the workspace archive. Search, the
+    /// MCP server, and the CLI only look at `docs/`, so an archived document is
+    /// invisible to agents until it is restored from the web UI.
+    pub fn archive(&self, workspace: &Workspace, slug: &str) -> Result<Doc> {
+        let doc = self.read(workspace, slug)?;
+        let path = self.doc_path(workspace, slug).map_err(MemoryError::Other)?;
+        let dir = self.archive_dir(workspace);
+        create_private_dir(&dir).map_err(MemoryError::Other)?;
+        let start = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let target = (start..)
+            .take(10)
+            .map(|nanos| dir.join(format!("{nanos}.md")))
+            .find(|candidate| !candidate.exists());
+        let Some(target) = target else {
+            return Err(MemoryError::Other(anyhow::anyhow!(
+                "could not find a free archive id"
+            )));
+        };
+        fs::rename(&path, &target)?;
+        Ok(doc)
+    }
+
+    /// Archived documents, newest deletion first.
+    pub fn archived(&self, workspace: &Workspace) -> Result<Vec<ArchivedSummary>> {
+        let dir = self.archive_dir(workspace);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(MemoryError::Other(err.into())),
+        };
+        let mut archived = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(doc) = Doc::parse(&text) else {
+                tracing::warn!(path = %path.display(), "skipping unreadable archived document");
+                continue;
+            };
+            archived.push((
+                id.parse::<i128>().unwrap_or(0),
+                ArchivedSummary {
+                    id: id.to_owned(),
+                    slug: doc.slug,
+                    title: doc.title,
+                    kind: doc.kind,
+                    archived_at: archived_at(id),
+                },
+            ));
+        }
+        archived.sort_by_key(|(nanos, _)| std::cmp::Reverse(*nanos));
+        Ok(archived.into_iter().map(|(_, summary)| summary).collect())
+    }
+
+    pub fn read_archived(&self, workspace: &Workspace, id: &str) -> Result<ArchivedDoc> {
+        let path = self
+            .archive_path(workspace, id)
+            .map_err(|err| MemoryError::Invalid(err.to_string()))?;
+        if !path.exists() {
+            return Err(MemoryError::NotFound(id.to_owned()));
+        }
+        let text = fs::read_to_string(&path)?;
+        let doc = Doc::parse(&text).map_err(MemoryError::Other)?;
+        Ok(ArchivedDoc {
+            id: id.to_owned(),
+            archived_at: archived_at(id),
+            doc,
+        })
+    }
+
+    /// Moves an archived document back into `docs/`, giving it a fresh slug if
+    /// the original name has been reused.
+    pub fn restore_archived(&self, workspace: &Workspace, id: &str) -> Result<Doc> {
+        let archived = self.read_archived(workspace, id)?;
+        let mut doc = archived.doc;
+        doc.slug = self.unique_slug(workspace, &doc.slug)?;
+        doc.updated = now();
+        let stored = self.store(workspace, doc).map_err(MemoryError::Other)?;
+        let path = self
+            .archive_path(workspace, id)
+            .map_err(|err| MemoryError::Invalid(err.to_string()))?;
+        fs::remove_file(&path)?;
+        Ok(stored)
+    }
+
+    /// Permanently removes an archived document. Only the web UI calls this.
+    pub fn purge_archived(&self, workspace: &Workspace, id: &str) -> Result<()> {
+        let path = self
+            .archive_path(workspace, id)
+            .map_err(|err| MemoryError::Invalid(err.to_string()))?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(MemoryError::NotFound(id.to_owned()))
+            }
+            Err(err) => Err(MemoryError::Other(err.into())),
+        }
     }
 
     pub fn summaries(
@@ -231,6 +356,18 @@ impl Memory {
             "could not find a free slug after 100 attempts".into(),
         ))
     }
+}
+
+fn archived_at(id: &str) -> String {
+    id.parse::<i128>()
+        .ok()
+        .and_then(|nanos| time::OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
+        .and_then(|stamp| {
+            stamp
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_default()
 }
 
 fn matches(doc: &Doc, filters: &Filters, cutoff: Option<&str>) -> bool {
@@ -468,6 +605,93 @@ mod tests {
             )
             .unwrap();
         assert_eq!(old.len(), 2);
+    }
+
+    #[test]
+    fn archiving_hides_a_doc_from_reads_and_search() {
+        let (_tmp, memory, workspace) = setup();
+        memory
+            .add(
+                &workspace,
+                new_doc("Restart policy", "panes relaunch"),
+                &Author::user(),
+            )
+            .unwrap();
+
+        memory.archive(&workspace, "restart-policy").unwrap();
+
+        assert!(matches!(
+            memory.read(&workspace, "restart-policy"),
+            Err(MemoryError::NotFound(_))
+        ));
+        assert!(
+            memory
+                .search(Some(&workspace), "relaunch", &Filters::default(), false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            memory
+                .summaries(&workspace, &Filters::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        let archived = memory.archived(&workspace).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].slug, "restart-policy");
+        assert_eq!(archived[0].title, "Restart policy");
+        assert!(!archived[0].archived_at.is_empty());
+
+        let detail = memory.read_archived(&workspace, &archived[0].id).unwrap();
+        assert!(detail.doc.body.contains("relaunch"));
+
+        let restored = memory
+            .restore_archived(&workspace, &archived[0].id)
+            .unwrap();
+        assert_eq!(restored.slug, "restart-policy");
+        assert!(memory.archived(&workspace).unwrap().is_empty());
+        assert_eq!(
+            memory.read(&workspace, "restart-policy").unwrap().body,
+            "panes relaunch"
+        );
+    }
+
+    #[test]
+    fn restoring_after_a_slug_is_reused_renames_the_doc() {
+        let (_tmp, memory, workspace) = setup();
+        memory
+            .add(&workspace, new_doc("Same title", "old"), &Author::user())
+            .unwrap();
+        memory.archive(&workspace, "same-title").unwrap();
+        // A new doc takes the slug back.
+        memory
+            .add(&workspace, new_doc("Same title", "new"), &Author::user())
+            .unwrap();
+        let archived = memory.archived(&workspace).unwrap();
+        let restored = memory
+            .restore_archived(&workspace, &archived[0].id)
+            .unwrap();
+        assert_eq!(restored.slug, "same-title-2");
+        assert_eq!(restored.body, "old");
+    }
+
+    #[test]
+    fn purging_removes_an_archived_doc_and_rejects_bad_ids() {
+        let (_tmp, memory, workspace) = setup();
+        memory
+            .add(&workspace, new_doc("T", "body"), &Author::user())
+            .unwrap();
+        memory.archive(&workspace, "t").unwrap();
+        let archived = memory.archived(&workspace).unwrap();
+        memory.purge_archived(&workspace, &archived[0].id).unwrap();
+        assert!(memory.archived(&workspace).unwrap().is_empty());
+        assert!(matches!(
+            memory.purge_archived(&workspace, &archived[0].id),
+            Err(MemoryError::NotFound(_))
+        ));
+        assert!(memory.read_archived(&workspace, "../escape").is_err());
+        assert!(memory.archived(&workspace).is_ok());
     }
 
     #[test]

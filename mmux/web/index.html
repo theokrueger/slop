@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#002b36">
   <title>mmux</title>
-  <link rel="icon" href="assets/favicon.svg?v=solarized" type="image/svg+xml">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/vendor/xterm.css">
   <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -15,19 +15,19 @@
 
   <div id="app" class="app" hidden>
     <aside class="sidebar">
-      <nav id="projects" class="projects" aria-label="projects"></nav>
-
-      <div class="sidebar-actions">
-        <button id="new-project" class="new-project" type="button">+ new project</button>
-        <button id="archive-toggle" class="archive-toggle" type="button" aria-label="archived projects" title="archived projects">[a]</button>
+      <div class="panel-head">
+        <h2 class="panel-title">projects</h2>
+        <button id="archive-toggle" class="button archive-toggle" type="button" aria-label="archived projects" title="archived projects">[a]</button>
+        <button id="new-project" class="button new-project" type="button">new</button>
       </div>
 
-      <section id="project-management" class="project-management" aria-label="project management" hidden>
-        <p id="project-cwd" class="project-cwd"></p>
+      <nav id="projects" class="projects" aria-label="projects"></nav>
 
+      <section id="project-management" class="project-management" aria-label="project management" hidden>
         <section class="project-memory" aria-label="project memory">
-          <div class="project-memory-head">
-            <h2 class="project-memory-title">memory</h2>
+          <div class="panel-head">
+            <h2 class="panel-title">memory</h2>
+            <button id="memory-archive-toggle" class="button memory-archive-toggle" type="button" aria-label="archived docs" title="archived docs">[a]</button>
             <button id="memory-new" class="button memory-new" type="button">new</button>
           </div>
 
@@ -44,7 +44,6 @@
           <p id="memory-list-error" class="error" hidden></p>
 
           <ul id="memory-list" class="memory-list" aria-label="memory docs"></ul>
-
         </section>
       </section>
 
@@ -136,6 +135,22 @@
 
       <div class="dialog-actions">
         <button id="memory-close" class="button" type="button">close</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="memory-archive-dialog" class="dialog memory-archive-dialog">
+    <div class="dialog-body memory-panel">
+      <h2>archived docs</h2>
+
+      <p id="memory-archive-error" class="error" hidden></p>
+      <button id="memory-archive-retry" class="button" type="button" hidden>retry</button>
+      <p id="memory-archive-empty" class="archive-empty" hidden>no archived docs</p>
+
+      <ul id="memory-archive-list" class="memory-list" aria-label="archived docs"></ul>
+
+      <div class="dialog-actions">
+        <button id="memory-archive-close" class="button" type="button">close</button>
       </div>
     </div>
   </dialog>

@@ -15,6 +15,7 @@ use mmux::auth::{AuthError, Authenticator};
 use mmux::config::{Config, PaneConfig, Slot};
 use mmux::memory::{Memory, MemoryReadiness};
 use mmux::session::SessionStore;
+use mmux::theme::Appearance;
 use mmux::web::{self, AppState};
 use mmux::workspace::Workspace;
 
@@ -45,6 +46,10 @@ struct TestApp {
 
 impl TestApp {
     fn new(template: Vec<PaneConfig>) -> Self {
+        Self::with_appearance(template, Appearance::Dark)
+    }
+
+    fn with_appearance(template: Vec<PaneConfig>, appearance: Appearance) -> Self {
         let root = TempDir::new().unwrap();
         std::fs::create_dir(root.path().join("alpha")).unwrap();
         std::fs::create_dir(root.path().join("beta")).unwrap();
@@ -56,6 +61,7 @@ impl TestApp {
         config.terminal.rows = 24;
         config.terminal.cols = 80;
         config.new_project.panes = template;
+        config.terminal.appearance = appearance;
         config.memory.dir = Some(state.path().join("memory"));
         // Keep the readiness probe away from the real user config.
         config.memory.pi_agent_dir = state.path().join("pi");
@@ -1037,4 +1043,258 @@ fn urlencode(value: &str) -> String {
         }
     }
     out
+}
+
+#[tokio::test]
+async fn deleted_memories_move_to_the_archive_and_can_be_restored() {
+    let app = TestApp::new(TestApp::default_template());
+    let cookie = app.login().await;
+    let workspace = app.root.path().to_string_lossy().into_owned();
+    let ws = urlencode(&workspace);
+
+    let (status, _, body) = app
+        .call(json_request(
+            Method::POST,
+            "/api/memory/docs",
+            json!({ "title": "Archived note", "kind": "decision", "body": "secret body", "workspace": workspace }),
+            &[(header::COOKIE.as_str(), &cookie)],
+            true,
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Deleting moves it out of the live docs and into the archive.
+    let (status, _, _) = app
+        .call(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/memory/docs/archived-note?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .header("x-mmux", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, _, body) = app
+        .call(
+            Request::builder()
+                .uri(format!("/api/memory/docs?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["docs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    let (status, _, _) = app
+        .call(
+            Request::builder()
+                .uri(format!("/api/memory/docs/archived-note?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, body) = app
+        .call(
+            Request::builder()
+                .uri(format!("/api/memory/archive?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let archive: Value = serde_json::from_slice(&body).unwrap();
+    let entries = archive["docs"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["slug"], "archived-note");
+    assert_eq!(entries[0]["kind"], "decision");
+    assert!(!entries[0]["archived_at"].as_str().unwrap().is_empty());
+    let id = entries[0]["id"].as_str().unwrap().to_owned();
+
+    // The body is readable from the archive, and restore puts it back.
+    let (status, _, body) = app
+        .call(
+            Request::builder()
+                .uri(format!("/api/memory/archive/{id}?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["body"],
+        "secret body"
+    );
+
+    let (status, _, _) = app
+        .call(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/memory/archive/{id}/restore?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _, body) = app
+        .call(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/memory/archive/{id}/restore?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .header("x-mmux", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["slug"],
+        "archived-note"
+    );
+
+    let (_, _, body) = app
+        .call(
+            Request::builder()
+                .uri(format!("/api/memory/archive?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["docs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    let (_, _, body) = app
+        .call(
+            Request::builder()
+                .uri(format!("/api/memory/docs?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["docs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Archive again and purge it permanently.
+    app.call(
+        Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/api/memory/docs/archived-note?workspace={ws}"))
+            .header(header::COOKIE, &cookie)
+            .header("x-mmux", "1")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let (_, _, body) = app
+        .call(
+            Request::builder()
+                .uri(format!("/api/memory/archive?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let archive: Value = serde_json::from_slice(&body).unwrap();
+    let id = archive["docs"][0]["id"].as_str().unwrap().to_owned();
+    let (status, _, _) = app
+        .call(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/memory/archive/{id}?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .header("x-mmux", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, _, body) = app
+        .call(
+            Request::builder()
+                .uri(format!("/api/memory/archive?workspace={ws}"))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["docs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn favicon_follows_the_configured_appearance() {
+    let dark = TestApp::new(TestApp::default_template());
+    let (status, headers, body) = dark
+        .call(
+            Request::builder()
+                .uri("/assets/favicon.svg")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "image/svg+xml");
+    let svg = String::from_utf8(body.to_vec()).unwrap();
+    assert!(svg.contains("#002b36"), "{svg}");
+    assert!(!svg.contains("#fdf6e3"), "{svg}");
+    dark.shutdown().await;
+
+    let light = TestApp::with_appearance(TestApp::default_template(), Appearance::Light);
+    let (status, _, body) = light
+        .call(
+            Request::builder()
+                .uri("/assets/favicon.svg")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let svg = String::from_utf8(body.to_vec()).unwrap();
+    assert!(svg.contains("#fdf6e3"), "{svg}");
+    assert!(svg.contains("#586e75"), "{svg}");
+    assert!(!svg.contains("#002b36"), "{svg}");
+    light.shutdown().await;
 }

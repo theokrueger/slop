@@ -29,6 +29,9 @@ const WORKSPACES_DIR: &str = "workspaces";
 const WORKSPACE_FILE: &str = "workspace.json";
 const DOCS_DIR: &str = "docs";
 const HISTORY_DIR: &str = "_history";
+/// Deleted documents. Never read by search, the MCP server, or the CLI; only
+/// the web UI can list, restore, or purge them.
+const ARCHIVE_DIR: &str = "_archive";
 const VERSION: u32 = 1;
 
 /// An on-disk memory vault. Shared by the server, the CLI, and the MCP server.
@@ -254,6 +257,19 @@ impl Memory {
         workspace.dir.join(DOCS_DIR)
     }
 
+    pub fn archive_dir(&self, workspace: &Workspace) -> PathBuf {
+        workspace.dir.join(ARCHIVE_DIR)
+    }
+
+    /// Path of one archived document. `id` is the deletion timestamp in
+    /// nanoseconds, which is also the file stem.
+    pub fn archive_path(&self, workspace: &Workspace, id: &str) -> Result<PathBuf> {
+        if id.is_empty() || id.len() > 20 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("invalid archived document id `{id}`");
+        }
+        Ok(self.archive_dir(workspace).join(format!("{id}.md")))
+    }
+
     pub fn doc_path(&self, workspace: &Workspace, slug: &str) -> Result<PathBuf> {
         if !is_valid_slug(slug) {
             bail!("invalid document slug `{slug}`");
@@ -451,7 +467,7 @@ pub fn expand(path: &Path) -> PathBuf {
     PathBuf::from(shellexpand::tilde(&text).into_owned())
 }
 
-fn create_private_dir(path: &Path) -> Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
     #[cfg(unix)]
     {

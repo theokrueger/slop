@@ -228,7 +228,9 @@ them.
 **Documents.** Markdown with TOML frontmatter (`title`, `slug`, `kind`, `tags`,
 `author`, `source`, `paths`, `supersedes`). Kinds are `note`, `decision`,
 `plan`, `runbook`, `retro`, `reference`. Revisions are kept in `_history/`.
-From a shell in a project directory:
+Deleting a document moves it to the workspace archive (`_archive/`), which
+search, the MCP server, and the CLI never read; only the web UI lists, restores,
+or permanently deletes archived docs. From a shell in a project directory:
 
 ```sh
 mmux mem add --title "Why panes restart" --kind decision --tag session
@@ -236,7 +238,7 @@ mmux mem list                 # SLUG / KIND / UPDATED / TITLE
 mmux mem search restart       # quoted phrases and -exclusions work
 mmux mem show why-panes-restart
 mmux mem edit why-panes-restart --file notes.md
-mmux mem rm why-panes-restart --yes
+mmux mem rm why-panes-restart --yes   # moves it to the archive
 mmux mem history why-panes-restart
 ```
 
@@ -244,6 +246,16 @@ Every command accepts `--workspace PATH` (default: the current directory) and
 `--json`. Reads never create a vault; only writes do. The workspace is resolved
 by longest known path prefix, so running a command from a subdirectory still
 lands in the project's vault.
+
+The `archive` button in the memory panel switches the list to deleted documents.
+Each row shows the deletion time; opening one gives a read-only view with
+`restore` and `delete permanently`. Models cannot reach this: the archive lives
+outside `docs/`, so `memory_search` and `memory_read` never see it.
+
+The list in the project panel refreshes by itself when the vault changes,
+whether the write came from the UI, an agent over MCP, or `mmux mem` in a shell:
+the server fingerprints document metadata every two seconds and pushes a
+`memory_changed` event on the existing events stream.
 
 **Agents reach memory over MCP.** `mmux mcp` is a stdio MCP server with three
 tools: `memory_search`, `memory_read`, and `memory_write`. It reads the same

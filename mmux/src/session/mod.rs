@@ -59,6 +59,9 @@ pub enum SessionEvent {
         project_id: ProjectId,
         pane_id: PaneId,
     },
+    /// Vault files changed outside this process (an agent over MCP, or
+    /// `mmux mem` from a shell). Clients re-fetch their memory list.
+    MemoryChanged,
 }
 
 #[derive(Debug, Error)]
@@ -172,6 +175,12 @@ impl SessionStore {
 
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.events.subscribe()
+    }
+
+    /// The application-wide change bus. Used by the memory watcher to wake
+    /// connected browsers; every event means "re-fetch the authoritative state".
+    pub fn event_sender(&self) -> broadcast::Sender<SessionEvent> {
+        self.events.clone()
     }
 
     /// Restores persisted projects before the server starts accepting clients.
@@ -870,6 +879,15 @@ mod tests {
             SessionEvent::ProjectsChanged
         ));
         store.shutdown().await;
+    }
+
+    #[test]
+    fn memory_changed_serializes_for_the_events_stream() {
+        let event = SessionEvent::MemoryChanged;
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"type":"memory_changed"}"#
+        );
     }
 
     #[test]

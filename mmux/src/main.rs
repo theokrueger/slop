@@ -111,6 +111,9 @@ async fn run(config: Config, config_path: Option<&Path>) -> anyhow::Result<()> {
     // Memory is optional: when it is disabled or there is no state directory,
     // the rest of mmux works exactly as before.
     let memory = Memory::from_config(&config.memory, state_dir.as_deref()).map(Arc::new);
+    if let Some(memory) = memory.clone() {
+        memory::watch::spawn(memory, sessions.event_sender());
+    }
     let readiness = if memory.is_some() {
         memory::readiness::check(&config.memory)
     } else {

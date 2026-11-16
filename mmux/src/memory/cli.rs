@@ -34,10 +34,10 @@ pub enum MemAction {
     Edit(EditArgs),
     /// Append a section to an existing document.
     Append(AppendArgs),
-    /// Delete a document permanently.
+    /// Move a document to the project archive (restore it from the web UI).
     Rm {
         slug: String,
-        /// Required: deletion is never implicit.
+        /// Required: archiving is never implicit.
         #[arg(long)]
         yes: bool,
     },
@@ -215,8 +215,8 @@ fn run_action(memory: &Memory, cwd: &Path, action: MemAction) -> Result<()> {
                 bail!("refusing to delete `{slug}` without --yes");
             }
             let workspace = memory.workspace_for(cwd)?;
-            memory.remove(&workspace, &slug)?;
-            println!("deleted {slug}");
+            memory.archive(&workspace, &slug)?;
+            println!("archived {slug}");
         }
         MemAction::List(args) => {
             let summaries = match memory.existing_workspace_for(cwd) {

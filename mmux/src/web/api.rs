@@ -539,7 +539,7 @@ pub async fn memory_doc_delete(
     require_mutation(&headers)?;
     let memory = memory(&state)?;
     let workspace = resolve_workspace(&state, memory.clone(), query.workspace, true).await?;
-    tokio::task::spawn_blocking(move || memory.remove(&workspace, &slug))
+    tokio::task::spawn_blocking(move || memory.archive(&workspace, &slug))
         .await
         .map_err(ApiError::from_join)?
         .map_err(ApiError::from)?;
@@ -586,6 +586,89 @@ pub async fn memory_search(
             .map_err(ApiError::from)?;
     let hits: Vec<_> = hits.into_iter().take(limit).collect();
     Ok(Json(serde_json::json!({ "hits": hits })))
+}
+
+// ---------------------------------------------------------------------------
+// Memory archive
+//
+// Deleting a document moves it under `<workspace>/_archive/`. Search, the MCP
+// server, and the CLI never look there, so archived docs are invisible to
+// agents; only these authenticated endpoints can list, read, restore, or purge.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ArchiveQuery {
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
+pub async fn memory_archive(
+    State(state): State<AppState>,
+    AuthUser(_user): AuthUser,
+    Query(query): Query<ArchiveQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let memory = memory(&state)?;
+    let workspace = resolve_workspace(&state, memory.clone(), query.workspace, false).await?;
+    let handle = workspace.clone();
+    let docs = tokio::task::spawn_blocking(move || memory.archived(&handle))
+        .await
+        .map_err(ApiError::from_join)?
+        .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({
+        "workspace": { "key": workspace.key, "path": workspace.path },
+        "docs": docs,
+    })))
+}
+
+pub async fn memory_archive_read(
+    State(state): State<AppState>,
+    AuthUser(_user): AuthUser,
+    Path(id): Path<String>,
+    Query(query): Query<ArchiveQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let memory = memory(&state)?;
+    let workspace = resolve_workspace(&state, memory.clone(), query.workspace, false).await?;
+    let archived = tokio::task::spawn_blocking(move || memory.read_archived(&workspace, &id))
+        .await
+        .map_err(ApiError::from_join)?
+        .map_err(ApiError::from)?;
+    let value = serde_json::to_value(&archived)
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(value))
+}
+
+pub async fn memory_archive_restore(
+    State(state): State<AppState>,
+    AuthUser(_user): AuthUser,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<ArchiveQuery>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    require_mutation(&headers)?;
+    let memory = memory(&state)?;
+    let workspace = resolve_workspace(&state, memory.clone(), query.workspace, true).await?;
+    let doc = tokio::task::spawn_blocking(move || memory.restore_archived(&workspace, &id))
+        .await
+        .map_err(ApiError::from_join)?
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(doc_view(doc)?)))
+}
+
+pub async fn memory_archive_purge(
+    State(state): State<AppState>,
+    AuthUser(_user): AuthUser,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<ArchiveQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_mutation(&headers)?;
+    let memory = memory(&state)?;
+    let workspace = resolve_workspace(&state, memory.clone(), query.workspace, false).await?;
+    tokio::task::spawn_blocking(move || memory.purge_archived(&workspace, &id))
+        .await
+        .map_err(ApiError::from_join)?
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------

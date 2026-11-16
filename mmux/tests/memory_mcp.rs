@@ -214,6 +214,74 @@ fn unknown_methods_and_garbage_arguments_are_contained() {
     assert_eq!(responses[3]["result"]["isError"], true);
 }
 
+#[test]
+fn archived_documents_are_invisible_to_the_model() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let workspace = dir.path().join("workspace");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    // Write through MCP so the vault layout comes from the product itself.
+    let responses = session(
+        &workspace,
+        &state,
+        &[
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": { "protocolVersion": "2025-06-18" } }),
+            call(
+                2,
+                "memory_write",
+                json!({ "title": "Secret note", "body": "hidden from models" }),
+            ),
+        ],
+    );
+    assert_eq!(responses[1]["result"]["isError"], false);
+
+    // Move it into the archive, exactly as a UI delete does.
+    let path = walk(&state)
+        .into_iter()
+        .find(|path| path.ends_with("docs/secret-note.md"))
+        .expect("document on disk");
+    let docs = Path::new(&path).parent().expect("docs dir").to_path_buf();
+    let archive = docs.parent().expect("workspace dir").join("_archive");
+    std::fs::create_dir_all(&archive).unwrap();
+    std::fs::rename(&path, archive.join("1700000000000000000.md")).unwrap();
+
+    let responses = session(
+        &workspace,
+        &state,
+        &[
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": { "protocolVersion": "2025-06-18" } }),
+            call(2, "memory_read", json!({ "slug": "secret-note" })),
+            call(3, "memory_search", json!({ "query": "hidden" })),
+            call(
+                4,
+                "memory_write",
+                json!({ "title": "Fresh note", "body": "live" }),
+            ),
+        ],
+    );
+
+    assert_eq!(
+        responses[1]["result"]["isError"], true,
+        "archived docs must not be readable through MCP"
+    );
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "archived docs must not appear in search"
+    );
+    // The archived slug is not reserved: a fresh document can use the name.
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["slug"],
+        "fresh-note"
+    );
+}
+
 fn walk(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
