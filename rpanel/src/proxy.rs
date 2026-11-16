@@ -56,6 +56,21 @@ pub async fn handler(State(state): State<Arc<AppState>>, req: Request) -> Respon
         return (StatusCode::BAD_GATEWAY, "bad gateway\n").into_response();
     };
 
+    // Captured before the request is forwarded, for the access log: enough to
+    // tell why an upstream rejected a request (CSRF headers, session cookie).
+    let referer = header(req.headers(), header::REFERER);
+    let origin = header(req.headers(), header::ORIGIN);
+    let credentials = if req.headers().contains_key(header::COOKIE) {
+        "cookie"
+    } else if req.headers().contains_key(header::AUTHORIZATION) {
+        "authorization"
+    } else {
+        "none"
+    };
+    // Cookie names only; values are session secrets. Duplicates here mean the
+    // browser holds a stale cookie the upstream may pick over the fresh one.
+    let cookie_names = cookie_names(req.headers());
+
     let client_ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -78,6 +93,11 @@ pub async fn handler(State(state): State<Arc<AppState>>, req: Request) -> Respon
                 method = %method,
                 %path,
                 status = response.status().as_u16(),
+                referer,
+                origin,
+                credentials,
+                cookie_names,
+                set_cookie = %set_cookie_description(response.headers()),
                 "proxied"
             );
             response
@@ -87,6 +107,66 @@ pub async fn handler(State(state): State<Arc<AppState>>, req: Request) -> Respon
             (StatusCode::BAD_GATEWAY, "bad gateway\n").into_response()
         }
     }
+}
+
+fn cookie_names(headers: &HeaderMap) -> String {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| {
+            let (name, value) = pair.split_once('=')?;
+            let name = name.trim();
+            (!name.is_empty()).then(|| format!("{name}#{:x}", fingerprint(value.trim())))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Stable-within-a-run hash of a cookie value, so a request can be matched to
+/// the `Set-Cookie` that produced it without logging the secret itself.
+fn fingerprint(value: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `name[attributes]` for each `Set-Cookie`, with the value redacted.
+fn set_cookie_description(headers: &HeaderMap) -> String {
+    headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(|value| {
+            let mut parts = value.split(';').map(str::trim);
+            let (name, value) = parts
+                .next()
+                .and_then(|pair| pair.split_once('='))
+                .unwrap_or(("", ""));
+            let attributes = parts
+                .filter(|attribute| {
+                    let attribute = attribute.to_ascii_lowercase();
+                    attribute.starts_with("path")
+                        || attribute.starts_with("domain")
+                        || attribute.starts_with("samesite")
+                        || attribute == "secure"
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{name}#{:x}[{attributes}]", fingerprint(value.trim()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn header(headers: &HeaderMap, name: HeaderName) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Whether the request asks to switch protocols (a WebSocket handshake, or any
@@ -215,6 +295,9 @@ fn copy_upstream_headers(
     if route.rewrite_prefix().is_some() {
         target.remove(header::ACCEPT_ENCODING);
     }
+    if let Some(namespace) = route.cookie_prefix() {
+        namespace_request_cookies(target, namespace);
+    }
 
     target.insert(
         header::HOST,
@@ -310,6 +393,9 @@ async fn relay_response(
         *response.status_mut() = parts.status;
         *response.version_mut() = parts.version;
         copy_headers(&parts.headers, response.headers_mut());
+        if let Some(namespace) = route.cookie_prefix() {
+            namespace_response_cookies(response.headers_mut(), namespace);
+        }
         let headers = response.headers_mut();
         // The body changed, so its length and validators are stale.
         headers.remove(header::CONTENT_ENCODING);
@@ -326,10 +412,87 @@ async fn relay_response(
     *response.status_mut() = parts.status;
     *response.version_mut() = parts.version;
     copy_headers(&parts.headers, response.headers_mut());
+    if let Some(namespace) = route.cookie_prefix() {
+        namespace_response_cookies(response.headers_mut(), namespace);
+    }
     if let Some(location) = location {
         response.headers_mut().insert(header::LOCATION, location);
     }
     response
+}
+
+/// Renames this group's cookies into the group namespace on the way to the
+/// client, so another app on the same origin cannot shadow them (two `SID`s
+/// on one host is a login loop waiting to happen).
+fn namespace_response_cookies(headers: &mut HeaderMap, namespace: &str) {
+    let values: Vec<String> = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+    if values.is_empty() {
+        return;
+    }
+    headers.remove(header::SET_COOKIE);
+    for value in values {
+        let renamed = match value.split_once('=') {
+            Some((name, rest)) if !name.trim().starts_with(namespace) => {
+                format!("{namespace}{name}={rest}")
+            }
+            _ => value,
+        };
+        if let Ok(value) = HeaderValue::from_str(&renamed) {
+            headers.append(header::SET_COOKIE, value);
+        }
+    }
+}
+
+/// Restores the group's cookie names for the upstream. Stale, un-namespaced
+/// cookies with the same name are dropped: they belong to the whole origin and
+/// would otherwise be picked over the fresh session.
+fn namespace_request_cookies(target: &mut HeaderMap, namespace: &str) {
+    let values: Vec<String> = target
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+    if values.is_empty() {
+        return;
+    }
+    let mut plain: Vec<(String, String)> = Vec::new();
+    let mut namespaced: Vec<(String, String)> = Vec::new();
+    for value in &values {
+        for pair in value.split(';') {
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let (name, value) = (name.trim(), value.trim());
+            if name.is_empty() {
+                continue;
+            }
+            match name.strip_prefix(namespace) {
+                Some(name) => namespaced.push((name.to_owned(), value.to_owned())),
+                None => plain.push((name.to_owned(), value.to_owned())),
+            }
+        }
+    }
+    if namespaced.is_empty() {
+        return;
+    }
+    plain.retain(|(name, _)| !namespaced.iter().any(|(fresh, _)| fresh == name));
+    // Namespaced cookies go last so a duplicate the browser kept resolves to
+    // the fresh value.
+    let pairs: Vec<String> = plain
+        .iter()
+        .chain(namespaced.iter())
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    target.remove(header::COOKIE);
+    if let Ok(value) = HeaderValue::from_str(&pairs.join("; ")) {
+        target.insert(header::COOKIE, value);
+    }
 }
 
 /// Whether a response body can be rewritten: a plain 200 of a text format,
@@ -379,26 +542,18 @@ fn rewrite_body(bytes: &[u8], prefix: &str) -> Vec<u8> {
     }
 }
 
-/// Prefixes root-absolute URLs in a document: quoted string values (`"/x"`,
-/// `'/x'`, `` `/x` ``) and CSS `url(/x)`. Values that already start with the
-/// prefix, protocol-relative URLs (`//host`) and bare `"/"` are left alone.
+/// Prefixes root-absolute URLs in a document: values of HTML attributes
+/// (`href="/x"`, `src='/x'`, `action`, `poster`) and CSS `url(/x)`.
+/// Bare quoted strings are left alone: rewriting every `"/` corrupts regex
+/// literals in vendored scripts (`replace(/"/g, ...)`), which silently breaks
+/// the pages that load them.
 fn rewrite_absolute_paths(text: &str, prefix: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut result: Option<String> = None;
     let mut copied = 0;
     let mut i = 0;
     while i < bytes.len() {
-        let at = match bytes[i] {
-            b'"' | b'\'' | b'`' => {
-                if i + 2 < bytes.len() && bytes[i + 1] == b'/' && is_path_byte(bytes[i + 2]) {
-                    Some(i + 1)
-                } else {
-                    None
-                }
-            }
-            b'u' | b'U' => url_target(bytes, i),
-            _ => None,
-        };
+        let at = attribute_target(bytes, i).or_else(|| url_target(bytes, i));
         if let Some(at) = at
             && needs_prefix(&text[at..], prefix)
         {
@@ -416,13 +571,50 @@ fn rewrite_absolute_paths(text: &str, prefix: &str) -> Option<String> {
     })
 }
 
+/// Byte offset of the `/` in an HTML attribute value that starts a path, e.g.
+/// `href="/x"` or `src='/x'`. The value must be quoted and the attribute must
+/// follow markup, so JS assignments are not touched.
+fn attribute_target(bytes: &[u8], i: usize) -> Option<usize> {
+    const ATTRIBUTES: [&[u8]; 4] = [b"href", b"src", b"action", b"poster"];
+    if i > 0 && !matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n' | b'<') {
+        return None;
+    }
+    for attribute in ATTRIBUTES {
+        if bytes.len() < i + attribute.len() + 3
+            || !bytes[i..i + attribute.len()].eq_ignore_ascii_case(attribute)
+        {
+            continue;
+        }
+        let mut at = i + attribute.len();
+        if bytes.get(at) != Some(&b'=') {
+            continue;
+        }
+        at += 1;
+        while bytes.get(at).is_some_and(|byte| byte.is_ascii_whitespace()) {
+            at += 1;
+        }
+        if !matches!(bytes.get(at), Some(b'"') | Some(b'\'')) {
+            continue;
+        }
+        at += 1;
+        if bytes.get(at) == Some(&b'/') && bytes.get(at + 1).is_some_and(|byte| is_path_byte(*byte))
+        {
+            return Some(at);
+        }
+    }
+    None
+}
+
 /// Byte offset of the `/` in an unquoted CSS `url(/...)`, if `i` starts one.
 fn url_target(bytes: &[u8], i: usize) -> Option<usize> {
     if i + 5 > bytes.len() || !bytes[i..i + 4].eq_ignore_ascii_case(b"url(") {
         return None;
     }
     let mut at = i + 4;
-    while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+    while bytes.get(at).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        at += 1;
+    }
+    if matches!(bytes.get(at), Some(b'"') | Some(b'\'')) {
         at += 1;
     }
     (bytes.get(at) == Some(&b'/') && bytes.get(at + 1).is_some_and(|byte| is_path_byte(*byte)))
@@ -710,6 +902,7 @@ mod tests {
             forwarded_prefix: false,
             rewrite: false,
             preserve_origin: false,
+            cookie_namespace: false,
         };
         let routes =
             crate::route::build_routes(&indexmap::IndexMap::from([("qbit".to_string(), group)]));
@@ -738,6 +931,7 @@ mod tests {
             forwarded_prefix: false,
             rewrite: false,
             preserve_origin: false,
+            cookie_namespace: false,
         };
         let routes = crate::route::build_routes(&indexmap::IndexMap::from([
             ("root".to_string(), group("root:1", "/*", "/root/*")),
@@ -759,6 +953,7 @@ mod tests {
             forwarded_prefix: false,
             rewrite: false,
             preserve_origin: false,
+            cookie_namespace: false,
         };
         let route = Route::new("qbit", &group, "/qbittorrent/*", "/*");
         let mut headers = HeaderMap::new();
@@ -786,6 +981,7 @@ mod tests {
             forwarded_prefix: false,
             rewrite: false,
             preserve_origin: false,
+            cookie_namespace: false,
         };
         let route = Route::new("qbit", &group, "/qbittorrent/*", "/*");
         let mut headers = HeaderMap::new();
@@ -858,16 +1054,36 @@ mod tests {
             r#"<link href="/app/css/style.css"><script src="/app/scripts/app.js"></script>"#
         );
 
-        let js = r#"fetch("/api/v2/x"); a.split("/"); fetch('/api/y'); const u = `/api/z`;"#;
-        assert_eq!(
-            rewrite_absolute_paths(js, "/app").unwrap(),
-            r#"fetch("/app/api/v2/x"); a.split("/"); fetch('/app/api/y'); const u = `/app/api/z`;"#
-        );
-
         let css = "a { background: url(/images/x.png) } b { background: url( '/images/y.png' ) }";
         assert_eq!(
             rewrite_absolute_paths(css, "/app").unwrap(),
             "a { background: url(/app/images/x.png) } b { background: url( '/app/images/y.png' ) }"
+        );
+    }
+
+    #[test]
+    fn leaves_scripts_and_other_strings_alone() {
+        // A vendored library: rewriting `"/` here corrupts the regex literal
+        // and breaks every page that loads it.
+        for script in [
+            r#"return(""+t).replace(/&/g,"&amp;").replace(/"/g,"&quot;")"#,
+            r#"gradient.to.replace(/\"/,"")"#,
+            r#"fetch("/api/v2/x"); a.split("/"); const u = `/api/z`;"#,
+            r#"var data="/not-an-attribute""#,
+        ] {
+            assert_eq!(rewrite_absolute_paths(script, "/app"), None, "{script}");
+        }
+    }
+
+    #[test]
+    fn rewrites_quoted_and_unquoted_css_urls() {
+        assert_eq!(
+            rewrite_absolute_paths("x { background: url( \"/a.png\" ) }", "/app").unwrap(),
+            "x { background: url( \"/app/a.png\" ) }"
+        );
+        assert_eq!(
+            rewrite_absolute_paths("@font-face { src: url(//cdn.test/f.woff) }", "/app"),
+            None
         );
     }
 
@@ -915,6 +1131,49 @@ mod tests {
         // Default ports are canonical everywhere; a cross-site origin stays
         // cross-site, so this does not weaken the check.
         assert_eq!(headers[header::REFERER], "https://evil.test/x");
+    }
+
+    #[test]
+    fn namespaces_cookies_away_from_other_apps() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("SID=abc123; path=/; HttpOnly"),
+        );
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("theme=dark; path=/"),
+        );
+        namespace_response_cookies(&mut headers, "rp_qbittorrent_");
+        let cookies: Vec<_> = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            cookies,
+            [
+                "rp_qbittorrent_SID=abc123; path=/; HttpOnly",
+                "rp_qbittorrent_theme=dark; path=/"
+            ]
+        );
+    }
+
+    #[test]
+    fn restores_namespaced_cookies_and_drops_stale_ones() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("SID=stale; other=1; rp_qbittorrent_SID=fresh"),
+        );
+        namespace_request_cookies(&mut headers, "rp_qbittorrent_");
+        assert_eq!(headers[header::COOKIE], "other=1; SID=fresh");
+
+        // Without a namespaced cookie the header is left alone.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_static("SID=x; a=b"));
+        namespace_request_cookies(&mut headers, "rp_qbittorrent_");
+        assert_eq!(headers[header::COOKIE], "SID=x; a=b");
     }
 
     #[test]

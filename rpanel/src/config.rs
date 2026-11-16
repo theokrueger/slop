@@ -162,6 +162,10 @@ pub struct Group {
     /// rewriting them there fails the cross-origin check.
     #[serde(default)]
     pub preserve_origin: bool,
+    /// Keep this group's cookies in their own namespace, so apps served on the
+    /// same origin cannot shadow each other's sessions (e.g. two `SID`s).
+    #[serde(default)]
+    pub cookie_namespace: bool,
 }
 
 impl Config {

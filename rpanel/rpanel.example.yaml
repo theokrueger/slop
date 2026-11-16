@@ -39,12 +39,16 @@ groups:
   "Name":
     host: "127.0.0.1:8080"
     https: false
-    # Rewrite root-absolute URLs (href="/x", url(/x), "/x" in JS) to this
-    # group's prefix, for upstreams that do not support a base path.
+    # Rewrite root-absolute URLs in HTML attributes (href="/x", src="/x") and
+    # CSS url(/x) to this group's prefix, for upstreams without a base path.
+    # Script contents are left untouched.
     # rewrite: true
     # Forward Origin/Referer unchanged for apps that validate them against
     # X-Forwarded-Host (reverse-proxy aware, e.g. qBittorrent).
     # preserve_origin: true
+    # Keep this group's cookies under rp_<prefix>_<name>, so another app on the
+    # same origin cannot shadow them (avoids login loops from a stale session).
+    # cookie_namespace: true
     paths:
       "/name": "/"
       "/name/*": "/*"

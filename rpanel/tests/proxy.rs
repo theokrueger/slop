@@ -363,7 +363,9 @@ async fn rewrites_absolute_urls_and_redirects() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::LOCATION], "/app/login");
     assert!(body.contains(r#"href="/app/css/style.css""#), "{body}");
-    assert!(body.contains(r#"fetch("/app/api/v2/x")"#), "{body}");
+    // Script strings are never rewritten (that corrupts regex literals);
+    // only markup attributes and CSS urls are.
+    assert!(body.contains(r#"fetch("/api/v2/x")"#), "{body}");
     // The upstream was asked for an uncompressed body so it can be rewritten.
     assert!(body.contains("encoding: none"), "{body}");
     assert_eq!(
@@ -460,4 +462,67 @@ groups:
         text.contains("referer=https://example.test/app/x "),
         "{text}"
     );
+}
+
+async fn upstream_cookies() -> String {
+    let app = Router::new().fallback(any(|request: Request| async move {
+        let cookie = request
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        (
+            StatusCode::OK,
+            [
+                (header::SET_COOKIE, "SID=upstream; path=/; HttpOnly"),
+                (header::CONTENT_TYPE, "text/plain"),
+            ],
+            format!("cookie={cookie}"),
+        )
+    }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.to_string()
+}
+
+#[tokio::test]
+async fn namespaces_cookies_per_group() {
+    let host = upstream_cookies().await;
+    let config = Config::parse(&format!(
+        r#"
+server: {{ allow_insecure: true }}
+groups:
+  app:
+    host: "{host}"
+    cookie_namespace: true
+    paths:
+      "/app/*": "/*"
+"#
+    ))
+    .unwrap();
+
+    // The browser still holds a bare `SID` for the whole origin; it must not
+    // shadow the group's own cookie, and it must not be forwarded.
+    let request = Request::builder()
+        .uri("/app/x")
+        .header("cookie", "SID=stale; other=1; rp_app_SID=fresh")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(state(config)).oneshot(request).await.unwrap();
+
+    let cookies: Vec<_> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(cookies, ["rp_app_SID=upstream; path=/; HttpOnly"]);
+
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&body), "cookie=other=1; SID=fresh");
 }

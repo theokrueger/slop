@@ -18,6 +18,7 @@ pub struct Route {
     forwarded_prefix: bool,
     rewrite: bool,
     preserve_origin: bool,
+    cookie_prefix: Option<String>,
 }
 
 impl Route {
@@ -28,6 +29,20 @@ impl Route {
         } else {
             from.to_owned()
         };
+        let cookie_prefix = config.cookie_namespace.then(|| {
+            let slug: String = prefix
+                .trim_matches('/')
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            format!("rp_{slug}_")
+        });
         Self {
             group: group.to_owned(),
             host: config.host.clone(),
@@ -39,7 +54,13 @@ impl Route {
             forwarded_prefix: config.forwarded_prefix,
             rewrite: config.rewrite,
             preserve_origin: config.preserve_origin,
+            cookie_prefix,
         }
+    }
+
+    /// Namespace applied to this group's cookies, e.g. `rp_qbittorrent_`.
+    pub fn cookie_prefix(&self) -> Option<&str> {
+        self.cookie_prefix.as_deref()
     }
 
     pub fn is_wildcard(&self) -> bool {
@@ -147,6 +168,7 @@ mod tests {
             forwarded_prefix: false,
             rewrite: false,
             preserve_origin: false,
+            cookie_namespace: false,
         }
     }
 

@@ -95,6 +95,7 @@ and a map of incoming path patterns to upstream path patterns.
 | `forwarded_prefix` | `false` | Send `X-Forwarded-Prefix` with the matched incoming path prefix (no trailing slash). |
 | `rewrite` | `false` | Rewrite root-absolute URLs in responses to the group's path prefix. |
 | `preserve_origin` | `false` | Forward `Origin`/`Referer` unchanged instead of rewriting them to the upstream origin. |
+| `cookie_namespace` | `false` | Keep the group's cookies under `rp_<prefix>_<name>` so apps on the same origin cannot shadow each other's sessions. |
 
 ```yaml
 groups:
@@ -160,15 +161,25 @@ client-supplied value), `X-Forwarded-Host`, `X-Forwarded-Proto`, and
   them. rpanel normally rewrites same-origin values to the upstream origin so
   apps that compare them against `Host` accept the request; apps that instead
   compare them against `X-Forwarded-Host` (reverse-proxy aware, e.g.
-  qBittorrent) reject that as cross-site and need this option.
+  qBittorrent) reject that as cross-site and need this option. Default ports
+  are canonicalized out of both that header and `X-Forwarded-Host`, because
+  browsers omit `:443` while a `Host: example:443` would otherwise not match.
+- `cookie_namespace: true` renames the group's cookies to
+  `rp_<prefix>_<name>` for the browser and restores them for the upstream.
+  Every app served under one origin shares the browser's cookie jar, so two
+  apps using `SID` (or a stale cookie left over from an earlier setup) shadow
+  each other and can cause endless login redirects. Stale un-namespaced
+  cookies of the same name are dropped on the way upstream.
 - `rewrite: true` on a group makes rpanel do what nginx `sub_filter` and
   `proxy_redirect` do for upstreams that do not support a base path. It
-  prefixes root-absolute URLs in `text/html`, `text/css`, JavaScript, and JSON
-  responses (`href="/x"`, `url(/x)`, `"/x"` string literals), and rewrites
+  prefixes root-absolute URLs in HTML attribute values (`href="/x"`,
+  `src="/x"`, `action`, `poster`) and in CSS `url(/x)`, and rewrites
   `Location` redirects that point at the upstream root. Requests to that group
   drop `Accept-Encoding` so bodies arrive uncompressed, and bodies over 4 MiB
-  are streamed through unmodified. Bare `/` values (including `split("/")`) are
-  left alone, so prefer apps that can be told their base path when possible.
+  are streamed through unmodified. Script strings are deliberately not
+  rewritten: touching every quoted `"/` corrupts regex literals in vendored
+  libraries (qBittorrent's MooTools broke this way), and paths built in
+  JavaScript are better handled by the app's own base-path setting.
 - The server shuts down gracefully on Ctrl-C or SIGTERM.
 
 ## Tests
