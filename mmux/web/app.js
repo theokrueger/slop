@@ -14,11 +14,12 @@
   // suppressed. This avoids duplicate replies reaching the program.
   const TERMINAL_QUERY = /\x1b\[(?:5n|6n|\?6n|(?:0)?c|>0?c)/g;
 
-  const PANE_NEIGHBORS = {
-    "top-left": { up: null, down: "bottom-left", left: null, right: "top-right" },
-    "top-right": { up: null, down: "bottom-right", left: "top-left", right: null },
-    "bottom-left": { up: "top-left", down: null, left: null, right: "bottom-right" },
-    "bottom-right": { up: "top-right", down: null, left: "bottom-left", right: null },
+  // Slot coordinates within the pane grid: [row, column].
+  const PANE_GRID = {
+    "top-left": [0, 0],
+    "top-right": [0, 1],
+    "bottom-left": [1, 0],
+    "bottom-right": [1, 1],
   };
   const ARROW_DIRECTIONS = {
     ArrowUp: "up",
@@ -952,14 +953,31 @@
   }
 
   function focusPaneInDirection(from, direction) {
-    const targetSlot = PANE_NEIGHBORS[from.slot]?.[direction];
-    if (!targetSlot) return;
+    const origin = PANE_GRID[from.slot];
+    if (!origin) return;
+
+    // Move along the pressed axis while holding the other coordinate fixed,
+    // then wrap to the opposite edge when nothing exists further that way.
+    const horizontal = direction === "left" || direction === "right";
+    const ahead = direction === "right" || direction === "down";
+    const axis = horizontal ? 1 : 0;
+    const cross = horizontal ? 0 : 1;
+
+    const candidates = [];
     for (const handle of state.handles.values()) {
-      if (handle.slot === targetSlot) {
-        handle.term.focus();
-        return;
-      }
+      const pos = PANE_GRID[handle.slot];
+      if (!pos || pos[cross] !== origin[cross]) continue;
+      candidates.push({ handle, offset: pos[axis] - origin[axis] });
     }
+    if (candidates.length < 2) return;
+
+    // Nearest pane in the pressed direction first; otherwise the farthest pane
+    // on the opposite edge (which sorts first in the wrap order).
+    candidates.sort((a, b) => (ahead ? a.offset - b.offset : b.offset - a.offset));
+    const target =
+      candidates.find((candidate) => (ahead ? candidate.offset > 0 : candidate.offset < 0))
+      || candidates[0];
+    target.handle.term.focus();
   }
 
   function basename(path) {
@@ -1978,20 +1996,22 @@
     window.location.replace("login");
   });
 
-  // Browsers on Linux and Windows focus the menu bar on a bare Alt press, which
-  // swallows the chord that follows: Alt+X never reaches xterm, so emacs M-x is
-  // impossible. Cancelling the default on Alt (and on Alt+key) keeps focus in
-  // the terminal; xterm still sees the keydown and sends ESC+key to the pane.
-  // Macs are exempt because Option is a compose key there, and AltGr must keep
-  // producing characters on Windows/Linux layouts that use it.
+  // Firefox focuses/opens its menu bar on the Alt *keyup*, which swallows the
+  // chord that follows: Alt+X never reaches xterm, so emacs M-x is impossible.
+  // Cancelling that one event keeps focus in the terminal. The Alt *keydown* is
+  // deliberately left alone: when it is cancelled some Firefox/GTK builds drop
+  // the modifier for the next key, so xterm sees altKey=false and sends a plain
+  // "x" instead of ESC+x. Macs are exempt because Option is a compose key
+  // there, and AltGr must keep producing characters on Windows/Linux layouts
+  // that use it.
   const APPLE = /mac|iphone|ipad/i.test(navigator.platform || navigator.userAgent);
   const keepAltInTerminal = (event) => {
-    if (APPLE || !event.altKey || event.ctrlKey || event.metaKey) return;
+    if (APPLE || event.ctrlKey || event.metaKey) return;
+    if (event.key !== "Alt") return;
     if (event.getModifierState && event.getModifierState("AltGraph")) return;
     if (!activePaneHandle()) return;
     event.preventDefault();
   };
-  document.addEventListener("keydown", keepAltInTerminal, true);
   document.addEventListener("keyup", keepAltInTerminal, true);
 
   // Firefox reserves Ctrl+Shift+C for DevTools. Handle it in the capture phase
