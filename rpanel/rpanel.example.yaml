@@ -39,6 +39,12 @@ groups:
   "Name":
     host: "127.0.0.1:8080"
     https: false
+    # Rewrite root-absolute URLs (href="/x", url(/x), "/x" in JS) to this
+    # group's prefix, for upstreams that do not support a base path.
+    # rewrite: true
+    # Forward Origin/Referer unchanged for apps that validate them against
+    # X-Forwarded-Host (reverse-proxy aware, e.g. qBittorrent).
+    # preserve_origin: true
     paths:
       "/name": "/"
       "/name/*": "/*"

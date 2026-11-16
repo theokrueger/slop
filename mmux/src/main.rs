@@ -36,7 +36,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
     let cli = Cli::parse();
 
     if cli.print_default_config {
@@ -44,7 +43,12 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Configuration lives in the TOML file, so load it before installing the
+    // subscriber: `[logging].filter` is the default filter. `RUST_LOG` still
+    // wins for one-off debugging.
     let mut config = Config::load(cli.config.as_deref())?;
+    init_tracing(&config.logging.filter);
+
     if let Some(bind) = cli.bind {
         config.server.bind = bind;
     }
@@ -150,9 +154,11 @@ async fn shutdown_signal() {
     }
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("mmux=info,tower_http=warn"));
+fn init_tracing(default_filter: &str) {
+    // `RUST_LOG` is an escape hatch for debugging, not the configuration
+    // surface; the documented default is `[logging].filter` in mmux.toml.
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

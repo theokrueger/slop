@@ -16,6 +16,8 @@ pub struct Route {
     prefix: String,
     wildcard: bool,
     forwarded_prefix: bool,
+    rewrite: bool,
+    preserve_origin: bool,
 }
 
 impl Route {
@@ -35,11 +37,18 @@ impl Route {
             prefix,
             wildcard,
             forwarded_prefix: config.forwarded_prefix,
+            rewrite: config.rewrite,
+            preserve_origin: config.preserve_origin,
         }
     }
 
     pub fn is_wildcard(&self) -> bool {
         self.wildcard
+    }
+
+    /// Whether `Origin`/`Referer` are forwarded as the client sent them.
+    pub fn preserve_origin(&self) -> bool {
+        self.preserve_origin
     }
 
     /// The raw incoming prefix. For a wildcard route this includes the trailing
@@ -57,6 +66,16 @@ impl Route {
         }
         let prefix = self.prefix.trim_end_matches('/');
         (!prefix.is_empty()).then_some(prefix)
+    }
+
+    /// The public prefix responses are rewritten to. `None` when the group did
+    /// not opt in or the route is at the root.
+    pub fn rewrite_prefix(&self) -> Option<&str> {
+        if !self.rewrite {
+            return None;
+        }
+        let prefix = self.prefix.trim_end_matches('/');
+        (!prefix.is_empty() && prefix != "/").then_some(prefix)
     }
 
     /// Returns the wildcard capture for `path`, or `Some("")` for an exact match.
@@ -126,6 +145,8 @@ mod tests {
                 .map(|(from, to)| (from.to_string(), to.to_string()))
                 .collect(),
             forwarded_prefix: false,
+            rewrite: false,
+            preserve_origin: false,
         }
     }
 

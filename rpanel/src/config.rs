@@ -151,6 +151,17 @@ pub struct Group {
     /// subpath (e.g. apps behind a path-prefix reverse proxy).
     #[serde(default)]
     pub forwarded_prefix: bool,
+    /// Rewrite root-absolute URLs in proxied responses to the incoming path
+    /// prefix, like nginx `sub_filter`/`proxy_redirect`. For upstreams that
+    /// emit `/css/...` or `"/api/..."` instead of relative paths.
+    #[serde(default)]
+    pub rewrite: bool,
+    /// Forward `Origin` and `Referer` unchanged instead of rewriting them to
+    /// the upstream origin. Use for upstreams that validate those headers
+    /// against `X-Forwarded-Host` (reverse-proxy aware, e.g. qBittorrent);
+    /// rewriting them there fails the cross-origin check.
+    #[serde(default)]
+    pub preserve_origin: bool,
 }
 
 impl Config {

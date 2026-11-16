@@ -93,6 +93,8 @@ and a map of incoming path patterns to upstream path patterns.
 | `https` | `false` | Connect to the upstream over TLS. |
 | `paths` | `{}` | Incoming path pattern -> upstream path pattern. |
 | `forwarded_prefix` | `false` | Send `X-Forwarded-Prefix` with the matched incoming path prefix (no trailing slash). |
+| `rewrite` | `false` | Rewrite root-absolute URLs in responses to the group's path prefix. |
+| `preserve_origin` | `false` | Forward `Origin`/`Referer` unchanged instead of rewriting them to the upstream origin. |
 
 ```yaml
 groups:
@@ -154,6 +156,19 @@ client-supplied value), `X-Forwarded-Host`, `X-Forwarded-Proto`, and
   the panel shows an error for that unit instead of failing the page.
 - Logging defaults to `info`. Set `RUST_LOG` (for example `RUST_LOG=debug`) to
   change the filter.
+- `preserve_origin: true` forwards `Origin` and `Referer` as the client sent
+  them. rpanel normally rewrites same-origin values to the upstream origin so
+  apps that compare them against `Host` accept the request; apps that instead
+  compare them against `X-Forwarded-Host` (reverse-proxy aware, e.g.
+  qBittorrent) reject that as cross-site and need this option.
+- `rewrite: true` on a group makes rpanel do what nginx `sub_filter` and
+  `proxy_redirect` do for upstreams that do not support a base path. It
+  prefixes root-absolute URLs in `text/html`, `text/css`, JavaScript, and JSON
+  responses (`href="/x"`, `url(/x)`, `"/x"` string literals), and rewrites
+  `Location` redirects that point at the upstream root. Requests to that group
+  drop `Accept-Encoding` so bodies arrive uncompressed, and bodies over 4 MiB
+  are streamed through unmodified. Bare `/` values (including `split("/")`) are
+  left alone, so prefer apps that can be told their base path when possible.
 - The server shuts down gracefully on Ctrl-C or SIGTERM.
 
 ## Tests

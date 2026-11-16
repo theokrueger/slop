@@ -14,6 +14,10 @@ pub const DEFAULT_CONFIG_TOML: &str = include_str!("../config.example.toml");
 pub const DEFAULT_ROWS: u16 = 30;
 pub const DEFAULT_COLS: u16 = 100;
 
+/// Default `tracing` filter when `[logging].filter` is unset and `RUST_LOG` is
+/// absent. `tower_http` is noisy at `info`, so it stays at `warn`.
+pub const DEFAULT_LOG_FILTER: &str = "mmux=info,tower_http=warn";
+
 /// Top-level mmux configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -23,6 +27,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub workspace: WorkspaceConfig,
     pub terminal: TerminalConfig,
+    pub logging: LoggingConfig,
     pub new_project: NewProjectConfig,
 }
 
@@ -71,6 +76,9 @@ impl Config {
         }
         if self.auth.pam_service.trim().is_empty() {
             return Err("auth.pam_service must not be empty".into());
+        }
+        if self.logging.filter.trim().is_empty() {
+            return Err("logging.filter must not be empty".into());
         }
         if self.workspace.root.as_os_str().is_empty() {
             return Err("workspace.root must not be empty".into());
@@ -178,6 +186,23 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             root: PathBuf::from("~"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// `tracing` environment-filter syntax, for example `"mmux=info"`.
+    /// Configuration belongs in this file, not in the service environment;
+    /// `RUST_LOG` still overrides it for one-off debugging.
+    pub filter: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            filter: DEFAULT_LOG_FILTER.to_owned(),
         }
     }
 }

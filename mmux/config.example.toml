@@ -32,6 +32,11 @@ cols = 100
 # This is reported to programs at startup so TUI backgrounds render correctly.
 appearance = "dark"
 
+[logging]
+# `tracing` filter syntax. Configure verbosity here, not in the service
+# environment; `RUST_LOG` is only an override for one-off debugging.
+filter = "mmux=info,tower_http=warn"
+
 # Every new project starts this set of panes, in the directory chosen in the
 # browser. Projects are created on demand and persisted in per-project
 # directories under $XDG_STATE_HOME/mmux/projects/; on restart they are

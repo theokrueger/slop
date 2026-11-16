@@ -297,3 +297,167 @@ groups: {}
     assert!(text.contains("rpanel"), "{text}");
     assert!(text.contains("Tary"), "{text}");
 }
+
+/// An upstream that emits root-absolute URLs and echoes the accepted encoding,
+/// like a WebUI that does not know it is served under a path prefix.
+async fn upstream_absolute() -> String {
+    let app = Router::new().fallback(any(|request: Request| async move {
+        let encoding = request
+            .headers()
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("none")
+            .to_owned();
+        let body = format!(
+            r#"<!doctype html><link href="/css/style.css"><script>fetch("/api/v2/x")</script><!-- encoding: {encoding} -->"#
+        );
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/html"),
+                (header::LOCATION, "/login"),
+            ],
+            body,
+        )
+    }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.to_string()
+}
+
+async fn proxy_html(rewrite: bool) -> (StatusCode, HeaderMap, String) {
+    let host = upstream_absolute().await;
+    let config = Config::parse(&format!(
+        r#"
+server: {{ allow_insecure: true }}
+groups:
+  app:
+    host: "{host}"
+    rewrite: {rewrite}
+    paths:
+      "/app/*": "/*"
+"#
+    ))
+    .unwrap();
+
+    let request = Request::builder()
+        .uri("/app/")
+        .header("accept-encoding", "gzip")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(state(config)).oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, headers, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn rewrites_absolute_urls_and_redirects() {
+    let (status, headers, body) = proxy_html(true).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::LOCATION], "/app/login");
+    assert!(body.contains(r#"href="/app/css/style.css""#), "{body}");
+    assert!(body.contains(r#"fetch("/app/api/v2/x")"#), "{body}");
+    // The upstream was asked for an uncompressed body so it can be rewritten.
+    assert!(body.contains("encoding: none"), "{body}");
+    assert_eq!(
+        headers[header::CONTENT_LENGTH],
+        body.len().to_string().as_str()
+    );
+}
+
+#[tokio::test]
+async fn leaves_responses_alone_without_rewrite() {
+    let (status, headers, body) = proxy_html(false).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::LOCATION], "/login");
+    assert!(body.contains(r#"href="/css/style.css""#), "{body}");
+    assert!(body.contains(r#"fetch("/api/v2/x")"#), "{body}");
+    assert!(body.contains("encoding: gzip"), "{body}");
+}
+
+#[tokio::test]
+async fn preserves_origin_and_referer_for_reverse_proxy_aware_apps() {
+    let host = upstream().await;
+    let config = Config::parse(&format!(
+        r#"
+server: {{ allow_insecure: true }}
+groups:
+  app:
+    host: "{host}"
+    preserve_origin: true
+    paths:
+      "/app/*": "/*"
+"#
+    ))
+    .unwrap();
+
+    let request = Request::builder()
+        .uri("/app/x")
+        .header("host", "example.test")
+        .header("origin", "https://example.test")
+        .header("referer", "https://example.test/app/x")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(state(config)).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    // qBittorrent compares these against X-Forwarded-Host, so they must arrive
+    // as the client sent them.
+    assert!(text.contains("origin=https://example.test"), "{text}");
+    assert!(
+        text.contains("referer=https://example.test/app/x"),
+        "{text}"
+    );
+    assert!(text.contains("xfh=example.test"), "{text}");
+}
+
+#[tokio::test]
+async fn canonicalizes_default_ports_for_origin_checks() {
+    let host = upstream().await;
+    let config = Config::parse(&format!(
+        r#"
+server: {{ cert: "/dev/null", key: "/dev/null" }}
+groups:
+  app:
+    host: "{host}"
+    preserve_origin: true
+    paths:
+      "/app/*": "/*"
+"#
+    ))
+    .unwrap();
+
+    // A browser on https://example.test:443 sends `Origin`/`Referer` without
+    // the default port, but the `Host` header can keep it.
+    let request = Request::builder()
+        .uri("/app/x")
+        .header("host", "example.test:443")
+        .header("origin", "https://example.test:443")
+        .header("referer", "https://example.test:443/app/x")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(state(config)).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("xfh=example.test "), "{text}");
+    assert!(
+        text.contains("origin=https://example.test referer="),
+        "{text}"
+    );
+    assert!(
+        text.contains("referer=https://example.test/app/x "),
+        "{text}"
+    );
+}

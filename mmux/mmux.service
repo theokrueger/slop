@@ -4,10 +4,14 @@ After=network-online.target
 
 [Service]
 Type=simple
+# All mmux configuration lives in %h/.config/mmux.toml ([server], [auth],
+# [workspace], [terminal], [logging], [new_project]); this unit deliberately
+# sets no mmux environment variables. Add `Environment=RUST_LOG=…` only as a
+# temporary override while debugging.
+#
 # Prepend Pi and user-local tools without replacing the inherited PATH.
 # $$ escapes systemd expansion so Bash can extend the value it receives.
 ExecStart=/bin/bash -lc 'export PATH="%h/.pi/agent/bin:%h/.local/share/pi-node/current/bin:%h/.local/bin:$$PATH"; exec %h/.cargo/bin/mmux'
-Environment=RUST_LOG=mmux=info
 Restart=on-failure
 RestartSec=2
 KillMode=control-group

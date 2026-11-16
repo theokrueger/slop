@@ -72,6 +72,10 @@ Configuration is read from `~/.config/mmux.toml` by default.
 `--config PATH` and `MMUX_CONFIG` select another file. `--bind ADDR` and
 `MMUX_BIND` override the listen address.
 
+Everything else is configured in that file — including `[logging]` — so a
+systemd unit does not need any mmux `Environment=` lines. `RUST_LOG` remains an
+override for one-off debugging.
+
 ## Projects and persistence
 
 The vertical list contains **projects**. Each project owns up to four panes
@@ -145,6 +149,9 @@ rows = 30
 cols = 100
 appearance = "dark"    # "dark" or "light"
 
+[logging]
+filter = "mmux=info,tower_http=warn"
+
 # Used for every newly created project. Projects are created from the UI in
 # the directory chosen there, and persisted for the next mmux start.
 [[new_project.panes]]
@@ -187,10 +194,10 @@ command = []
 
 ## Persistent user service
 
-A systemd user unit is provided in [`contrib/mmux.service`](contrib/mmux.service).
+A systemd user unit is provided in [`mmux.service`](mmux.service).
 
 ```sh
-install -Dm644 contrib/mmux.service ~/.config/systemd/user/mmux.service
+install -Dm644 mmux.service ~/.config/systemd/user/mmux.service
 systemctl --user daemon-reload
 systemctl --user enable --now mmux
 journalctl --user -u mmux -f

@@ -1,81 +1,102 @@
 # Session memory for mmux
 
-Status: design proposal. No code yet.
+Status: design proposal, v2. No code yet.
 
 ## 1. What "memory" means here
 
-mmux is the only component in the stack that sees *all* of a session: the
-project, its working directory, every pane command, the pi session IDs it
-resolves, and the raw PTY byte stream. That makes it the natural owner of
-memory — but the useful thing to own is not a model-written summary.
+mmux is the only component that sees the whole session: the project, its
+working directory, every pane command, the pi session IDs it resolves, and the
+raw PTY byte stream. It should own memory — but the useful thing to own is not
+a model-written summary.
 
-Research on agent memory (VibeMemBench, MemDev-Bench, Claude Code auto-memory
-issue tracker, `claude-mem` field reports) converges on a few uncomfortable
-findings:
+Research on agent memory (VibeMemBench, MemDev-Bench, Claude Code's auto-memory
+tracker, `claude-mem` field reports) converges on uncomfortable findings:
 
 - Most memory systems do not beat a memory-off baseline on coding tasks.
 - The dominant failure is *unrelated history injected into context*, not
-  missing recall. 69% of failures are "form degradation"; ~1% are ranking misses.
+  missing recall. 69% of failures are "form degradation", ~1% ranking misses.
 - Always-loaded memory rots: "months-old MEMORY.md silently loads into every
   session — no freshness indication, no expiry".
-- The patterns that do survive are boring: append-only source data, a small
-  curated index, explicit on-demand retrieval, and provenance you can audit.
+- What survives is boring: append-only source data, a small curated index,
+  explicit on-demand retrieval, audit-able provenance.
 
-So the design here has two layers with sharply different jobs:
+So: two layers, both plaintext, and the agent fetches on demand.
 
 | Layer | Contents | Written by | Purpose |
-|---|---|---|---|
-| **Docs** (memory proper) | meta-docs: decisions, plans, runbooks, project notes, retros | a human, or an agent *when asked* | durable knowledge |
-| **Archive** (history) | terminal transcripts + pi session transcripts | mmux, automatically | recall and search |
+| --- | --- | --- | --- |
+| **Docs** (memory proper) | meta-docs: decisions, plans, runbooks, notes, retros | a human, or an agent *when asked* | durable knowledge |
+| **History** | terminal transcripts + pi session transcripts | mmux, automatically | recall and search |
 
-Docs are the source of truth and are never auto-generated. The archive is
-read-only evidence that makes recall possible; it is never injected into a
-prompt by default. Nothing in mmux writes into a project repository.
+Closing a project never destroys either layer: the project definition moves to
+the **project archive** (see §5.4.1) and memory is keyed by workspace path, so
+it survives archive, restore, and even permanent deletion of the project.
 
-Explicit non-goals: auto-summarization, embeddings/vector search, knowledge
-graphs, screen replay into live panes, and writing `AGENTS.md`/`CLAUDE.md` into
-repos.
+Nothing auto-summarizes. Nothing is written into a project repository. Nothing
+is injected into a prompt beyond one server-description line.
 
-## 2. Design principles
+Explicit non-goals: SQLite or any database, embeddings, vector search,
+knowledge graphs, background LLM distillation, screen replay into live panes,
+and writing `AGENTS.md`/`CLAUDE.md`/`.pi/mcp.json` into repos.
 
-1. **Deliberate writes.** No background distillation. If a fact is worth
-   keeping, someone saves it (`mmux mem add`) or the user asks an agent to.
-2. **Docs are files, the index is derived.** A corrupt or deleted index is
-   always rebuildable from the vault. No memory content exists only in SQLite.
-3. **Bounded always-on cost.** At most one small generated index file
-   (~40 lines, hard 4 KB cap) is ever appended to an agent's context.
-4. **Provenance on every doc.** author, created/updated, source session and
-   pane, and a revision history. Stale docs are visible as stale.
-5. **Scope by canonical path, never by name.** Workspaces are keyed by
-   `canonicalize(cwd)` plus a short hash; the bug where two
-   `~/src/api` directories share memory does not exist here.
-6. **No repo writes, no network.** Vault lives under `$XDG_STATE_HOME/mmux`,
-   mode `0700`; the CLI talks to files only.
+## 2. Principles
+
+1. **Plaintext all the way.** Markdown docs, text logs, JSONL that pi already
+   writes. No `*.db`, no binary blobs, no migrations, no schema in the critical
+   path. Search is a streaming scan; `rg` over the vault is a valid debugging
+   tool.
+2. **No derived state.** No index to rebuild, therefore no index to corrupt or
+   to disagree with the files.
+3. **Deliberate writes.** No background distillation. A fact is kept because
+   someone saved it (`mmux mem add`) or asked an agent to.
+4. **Bounded always-on cost.** The only thing an agent sees before asking is a
+   one-line MCP server description. Everything else is a tool call.
+5. **Provenance on every doc.** author, created/updated, source session and
+   pane, revision history. Stale docs look stale.
+6. **Scope by canonical path, never by name.** Workspace key is
+   `basename + short hash of canonicalize(cwd)`; two `~/src/api` trees never
+   share memory.
+7. **Configuration is TOML, not environment.** Every knob lives in
+   `~/.config/mmux.toml` and is printed by `--print-default-config`. The
+   systemd unit therefore sets no mmux `Environment=` lines. `RUST_LOG` stays as
+   a debugging override, and `MMUX_CONFIG` only *selects a file*.
+8. **No network, no repo writes.** Vault under `$XDG_STATE_HOME/mmux`, mode
+   `0700`; the MCP server is stdio-only and inherits the pane's environment.
+9. **Deletion is never the default.** Closing a project archives it; panes stop
+   but the definition, and all memory for its workspace, survive. Irreversible
+   deletion is a deliberate action in the archive panel.
 
 ## 3. Layout
 
 ```text
 $XDG_STATE_HOME/mmux/
-  projects/                      # existing project persistence, unchanged
+  projects/                      # live projects, unchanged format
+    index.json                   # live project IDs in sidebar order
+    <project-id>/project.json
+  archive/                       # closed projects, same format + metadata
+    index.json                   # archived project IDs, newest first
+    <project-id>/
+      project.json               # byte-identical format to projects/
+      archived.json              # {version, archived_at, original_position, pane_count}
   memory/
-    workspaces.json              # canonical path -> workspace key (human index)
+    workspaces.json              # canonical path -> workspace key
     workspaces/
       <basename>-<hash8>/
         workspace.json           # {version, path, created, last_seen}
-        AGENT.md                 # generated: the memory protocol + doc index
         docs/
           <doc-slug>.md          # TOML frontmatter + markdown body
         _history/<doc-slug>/<utc-ns>.md
-        sessions.json            # pane -> pi session id manifest (phase 2)
-    transcripts/                 # phase 2, derived
-      <workspace>/<pane-uuid>.log
-    index.db                     # phase 2, derived SQLite FTS5
+        INDEX.md                 # optional, generated, for humans
+    transcripts/
+      <workspace>/<YYYY-MM-DD>/<slot>-<pane-uuid>.log
+    pi-sessions.json             # pane -> pi session id + resolved file path
 ```
 
-`workspace.json` and `workspaces.json` keep the absolute path, so renames and
-moves are detectable (`mmux mem rekey --from … --to …`).
+Memory is keyed by workspace path, not project id, so closing and reopening a
+project keeps its memory, and two projects on one directory share it. Archiving
+moves a `projects/<id>/` directory to `archive/<id>/`; it never touches
+`memory/`.
 
-### Doc format
+## 4. Doc format
 
 ```markdown
 +++
@@ -86,210 +107,575 @@ tags = ["session", "restart"]
 created = "2026-11-16T09:12:03Z"
 updated = "2026-11-16T09:12:03Z"
 author = "agent:pi"        # or "user"
-source = { session = "01a1e1ab-...", pane = "bottom-left" }
-paths = ["src/session/pane.rs"]   # optional: staleness checks
-supersedes = []                   # optional: slugs this replaces
+source = { session = "01a1e1ab-…", pane = "bottom-left" }
+paths = ["src/session/pane.rs"]   # optional, staleness checks
+supersedes = []                   # optional, slugs this replaces
 +++
 
 Runners are relaunched because a PTY cannot be serialized; the project
 definition, not the process, is the durable object.
 ```
 
-TOML frontmatter (`+++`) reuses the existing `toml` dependency and keeps one
-serializer for config and docs. Unknown keys are preserved on round-trip so
-hand-edited docs are not damaged by a save from the UI.
+TOML frontmatter reuses the existing `toml` dependency. Unknown keys survive a
+round-trip so a UI save never damages a hand-edited doc.
 
-## 4. Interfaces
+### 4.1 Author is inferred, never asked for
 
-### CLI (same binary, new subcommand)
+No `--author` flag. At write time the author string is derived from the caller's
+environment and frozen into the doc; later edits never rewrite it.
 
-`mmux mem …` — no server needed, no auth, safe to run from any pane:
+| Signal | `author` | `source` |
+| --- | --- | --- |
+| `MMUX_AGENT=pi` (mmux sets it for panes whose command is `pi`) | `agent:pi` | `{session, pane}` from `MMUX_SESSION_ID`/`MMUX_PANE_SLOT` |
+| `PI_CODING_AGENT=true` without `MMUX_AGENT` (nested pi, pi outside mmux) | `agent:pi` | `{session: null, pane: null}` |
+| HTTP UI | `user` | `{ui: true}` |
+| `mmux mem` from a shell with no agent env | `cli:<unix user>` | `{cwd}` |
+
+Two accuracy notes, both verified against pi 1.5.1:
+
+- pi exports `PI_CODING_AGENT=true` into its own process environment, so MCP
+  children inherit it.
+- pi **deletes** `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`
+  and `PI_REASONING_LEVEL` from inherited environments and re-adds them only for
+  shell tool commands. An MCP server therefore cannot learn the session or the
+  model from `PI_*`; it uses `MMUX_*` instead, and the history layer can backfill
+  `source.model` later from the session JSONL. Never block a write on it.
+
+`author` is provenance, not authorization. Nothing is gated on it.
+
+## 5. Interface: MCP first
+
+### 5.1 Why MCP instead of a CLI or an injected prompt
+
+- **Portable.** One protocol works for pi, Claude Code, Codex, and anything
+  else with MCP. mmux hosts arbitrary commands in panes, so a pi-only
+  mechanism would reach only pi panes.
+- **Zero always-on context.** pi supports `exposure: "deferred"` (tools are not
+  declared until `tool_search` loads them) and per-tool `toolExposure`. Only the
+  two hot tools are `direct`; the server's one-line `description` is the whole
+  fixed cost.
+- **Deliberate retrieval is a feature.** Research says agent-decided timing
+  beats passive injection ("a memory agent that decides when to speak
+  outperforms passive bank exposure, always-on injection, advisor-only guidance,
+  general retrieval": +8.3 pts Terminal-Bench 2.0). MCP has no auto-inject, and
+  that is the behaviour we want.
+- **Cheap to build.** A stdio MCP server is newline-delimited JSON-RPC:
+  `initialize`, `notifications/initialized`, `tools/list`, `tools/call`,
+  `ping`. ~300 lines with `serde_json`, no new dependency.
+
+### 5.2 Configuration: `[memory]` in `mmux.toml`
+
+The MCP server has no configuration of its own. `mmux mcp` is the same binary,
+so it loads the same `~/.config/mmux.toml` (or the file named by `--config` /
+`MMUX_CONFIG`) and reads `[memory]`:
+
+```toml
+[memory]
+# Master switch for the vault, the MCP server, and transcript capture.
+enabled = true
+# Vault root. Defaults to $XDG_STATE_HOME/mmux/memory.
+# dir = "~/.local/state/mmux/memory"
+# Largest document the CLI, UI, or MCP will write.
+max_doc_bytes = 65536
+# Previous revisions kept per document.
+history_versions = 20
+# "explicit": agents may write when asked; "deny": read-only for agents.
+agent_writes = "explicit"
+# pi integration for the readiness probe. mmux reads this, never writes it.
+pi_agent_dir = "~/.pi/agent"
+# pi session JSONL for the history layer. Defaults to <pi_agent_dir>/sessions.
+# pi_sessions = "~/.pi/agent/sessions"
+# Terminal history: "scrollback" or "off".
+terminal = "scrollback"
+scrollback_lines = 2000
+retention_days = 90
+max_workspace_bytes = 268435456
+```
+
+[`config.example.toml`](../config.example.toml) carries the same keys, so
+`mmux --print-default-config` is the authoritative reference.
+
+**The workspace is resolved from the working directory, not from env.**
+`mmux mcp` and `mmux mem` canonicalize `cwd`, then pick the *longest known
+workspace path that is a prefix* of it (`workspaces.json`), falling back to a
+fresh key derived from `cwd`. So a doc written from a subdirectory, a shell
+pane, or a non-mmux terminal lands in the expected vault, and `cd` inside a
+project never creates a stray one.
+
+The only environment mmux adds to panes is **identity, not configuration**
+(like `TMUX_PANE`), and everything is optional with a fallback:
 
 ```text
-mmux mem add --title "…" [--kind] [--tag] [--file -]      # create doc
-mmux mem edit <slug> [--file -]                          # replace body
-mmux mem append <slug> --file -                          # append section
-mmux mem rm <slug> [--yes]
-mmux mem list [--kind] [--tag] [--all-workspaces] [--json]
-mmux mem show <slug> [--json] [--raw]
-mmux mem search <query> [--kind] [--since] [--all-workspaces] [--json]
-mmux mem history <slug>
-mmux mem stale [--older-than 90d]
-mmux mem reindex | status | prune --older-than <dur>
+MMUX_PROJECT_ID, MMUX_PROJECT_NAME   # informational
+MMUX_PANE_SLOT, MMUX_SESSION_ID      # provenance: source.pane / source.session
+MMUX_AGENT=pi                        # provenance: author=agent:pi
+MMUX_CONFIG                          # path only, and only when mmux was
+                                     # started with an explicit config file
 ```
 
-Search output is a compact table by default (title, kind, updated, one-line
-summary, ~50–100 tokens/result) — deliberately the "layer 1" of progressive
-disclosure. `--json` is for agents that want to page through results.
+These are injected at spawn (into `PaneSpec.env`, never persisted into
+`project.json`). Missing values degrade gracefully: the author falls back to
+`cli:<user>` or `agent:pi` via inherited `PI_CODING_AGENT`, and the workspace
+still resolves from `cwd`. Nothing here is user-tunable, so nothing here
+belongs in the TOML.
 
-### Pane environment (phase 1)
+pi spawns stdio MCP servers with the session's environment, so **one** global
+entry in `~/.pi/agent/mcp.json` works for every pane and every project:
 
-`spawn_project` already builds a per-pane `env` map. Add:
+```json
+{
+  "mcpServers": {
+    "mmux": {
+      "command": "mmux",
+      "args": ["mcp"],
+      "description": "Project memory: search/read/write durable meta-docs and past session history",
+      "exposure": "deferred",
+      "toolExposure": {
+        "memory_search": "direct",
+        "memory_read": "direct",
+        "memory_write": "deferred",
+        "history_*": "deferred",
+        "memory_delete": "hidden"
+      },
+      "timeout": 20
+    }
+  }
+}
+```
+
+No per-project config file, no repo writes, no trust prompt. The server resolves
+its workspace from `cwd` plus `[memory]` in mmux.toml, so it behaves the same
+whether pi was started by mmux or by hand.
+
+**mmux never writes this file.** It is user configuration, shared with every
+pi session on the machine. mmux's job is to notice when it is absent or broken
+and say so once.
+
+### 5.2.1 Configuration resolution, precedence, and validation
+
+One rule: **if it is a setting, it is a key in `mmux.toml`.** Panes never carry
+settings, the systemd unit never carries settings, and the MCP entry never
+carries settings. `[logging]` already follows this rule (its filter moved into
+TOML so the unit could drop `Environment=RUST_LOG`); `[memory]` is the second.
+
+Resolution order, first match wins:
+
+1. `--config PATH`, on `mmux` or `mmux mcp`.
+2. `MMUX_CONFIG` — a *path*, not a setting. mmux sets it on panes only when it
+   was itself started with a non-default file, so `mmux mcp` reads the same
+   vault the server does.
+3. `~/.config/mmux.toml`.
+4. Built-in defaults, which are exactly what `mmux --print-default-config`
+   prints.
+
+No `[memory]` value is read from the environment. The only environment mmux
+honours at all are the pre-existing `MMUX_CONFIG` (file selector) and
+`MMUX_BIND` (listen-address override), both of which already have flags, plus
+`RUST_LOG`, which overrides `[logging].filter` for one run as a debugging aid.
+Everything else is a TOML key.
+
+| Key | Type | Default | Validation |
+| --- | --- | --- | --- |
+| `memory.enabled` | bool | `true` | — |
+| `memory.dir` | path | `$XDG_STATE_HOME/mmux/memory` | `~` expanded; must be absolute; created `0700` |
+| `memory.max_doc_bytes` | int | `65536` | `1024..=4194304` |
+| `memory.history_versions` | int | `20` | `0..=100`; `0` disables history |
+| `memory.agent_writes` | enum | `"explicit"` | `explicit` \| `deny` |
+| `memory.pi_agent_dir` | path | `~/.pi/agent` | read-only; never created or written by mmux |
+| `memory.pi_sessions` | path | `<pi_agent_dir>/sessions` | read-only |
+| `memory.terminal` | enum | `"scrollback"` | `scrollback` \| `off` |
+| `memory.scrollback_lines` | int | `2000` | `0..=100000`; `0` forces `off` |
+| `memory.retention_days` | int | `90` | `1..=3650` |
+| `memory.max_workspace_bytes` | int | `268435456` | `1048576..=68719476736` |
+
+Deliberately **not** configuration, and therefore not keys:
+
+- pane identity (`MMUX_PANE_SLOT`, `MMUX_SESSION_ID`, `MMUX_AGENT`) — process
+  context, like `TMUX_PANE`;
+- the workspace key — derived from `cwd` plus `workspaces.json`;
+- pi's `mcp.json` — user-owned, read-only to mmux, probed and reported only;
+- the MCP tool catalogue and its exposure — shipped with the binary, so the
+  behaviour of `memory_*` is a property of the mmux version, not a local knob.
+
+Staging requirement: `Config` uses `deny_unknown_fields`, so a `[memory]` block
+in `config.example.toml` fails to parse until `MemoryConfig` exists. The struct,
+its `Default`, the example block, and the `example_config_matches_defaults` test
+must land in one commit, and `--print-default-config` output must round-trip.
+Add one test per validation bound plus one asserting an unknown `[memory]` key
+is rejected.
+
+### 5.2.2 Startup readiness probe
+
+`mmux` runs one read-only probe at startup, before serving, and caches the
+verdict in `AppState`:
+
+1. Is `pi` on `PATH`? If not, status `NotApplicable` — no warning, no banner.
+   (mmux is useful without pi; don't nag.)
+2. Read `[memory] pi_agent_dir` from mmux.toml (default `~/.pi/agent`).
+3. Read `<config>/mcp.json`. A parse error is reported verbatim as `Invalid`.
+4. Find the entry: prefer the server named `mmux`; accept any entry whose
+   `command` basename is `mmux` and whose `args` contains `mcp`; report duplicate
+   matches as `Ambiguous`.
+5. Validate it: command resolves on `PATH` (or is an existing path), args
+   contain `mcp`, `enabled` is not `false`, and `exposure` is `deferred` or
+   `direct` (a `codemode`/`hidden` server would make memory unreachable without
+   `tool_search`, so that is a warning, not silent).
+
+Verdicts: `Ready`, `NotApplicable`, `Missing`, `Disabled`, `Mismatched(reason)`,
+`Invalid(error)`, `Ambiguous`. The probe never writes, never repairs, and never
+fail-closes: memory still works from the CLI and UI when the verdict is bad.
+
+On anything other than `Ready`/`NotApplicable`, mmux logs one `WARN` at startup
+and exposes the same text through `GET /api/memory/status`, which the UI renders
+as a dismissible banner. Both show copy-paste steps:
 
 ```text
-MMUX_PROJECT_ID, MMUX_PROJECT_NAME, MMUX_PROJECT_CWD
-MMUX_WORKSPACE_KEY, MMUX_MEMORY_DIR, MMUX_MEMORY_DOCS
-MMUX_MEMORY_CLI="mmux mem"      # so agents don't guess the syntax
-MMUX_PANE_SLOT, MMUX_SESSION_ID (when resolved)
+pi memory server not configured: <verdict detail>
+Add this to <config>/mcp.json under "mcpServers" (mmux will not do it for you):
+
+  "mmux": {
+    "command": "mmux",
+    "args": ["mcp"],
+    "exposure": "deferred",
+    "toolExposure": {
+      "memory_search": "direct",
+      "memory_read": "direct",
+      "memory_write": "deferred",
+      "history_*": "deferred",
+      "memory_delete": "hidden"
+    }
+  }
+
+then restart pi panes, or run: pi mcp add mmux --exposure deferred -- mmux mcp
 ```
 
-These are injected at spawn time and are **not** persisted in the pane
-command, so moving the state dir or changing config never leaves a stale path
-baked into `project.json`.
+`mmux mem status` prints the same verdict, and `mmux mem status --refresh`
+re-runs the probe (also the banner's "re-check" button) so a user who edits
+`mcp.json` does not have to restart mmux. There is no polling.
 
-### Context injection (opt-in, default on for pi)
+A project-level `.pi/mcp.json` can override or disable the entry. The probe
+reports what the user-level file says and the message mentions that a project
+file may still win; mmux does not read repos to guess.
 
-For panes whose command is `pi` (basename match), mmux appends
-`--append-system-prompt <vault>/AGENT.md` at spawn time. The file is small:
+Per-pane gating uses pi's existing flags, not new code:
+`--exclude-tools mcp__mmux__memory_write` for a read-only reviewer pane, or
+`--tools …` allowlists.
 
-```markdown
-## Project memory (mmux)
-This workspace has a memory vault at <path>. Save durable knowledge with
-`mmux mem add …`; search it with `mmux mem search <query>` before assuming
-prior context is lost. Do not write memory unless asked.
-## Documents
-- [decision] Pane restart policy — runners are relaunched, not resurrected
-- [plan] Memory v1 — vault first, transcript indexing second
+### 5.3 Tool catalog
+
+Few tools, each answering one question. All return compact text plus
+`structuredContent`.
+
+| Tool | Exposure | Purpose |
+| --- | --- | --- |
+| `memory_search(query, kind?, tag?, workspace?, since?, limit?)` | direct | ranked index rows: slug, title, kind, updated, one-line snippet (~50–100 tokens/hit) |
+| `memory_read(slug, max_bytes?)` | direct | full doc with frontmatter and provenance |
+| `memory_write(title, kind, body, tags?, paths?, supersedes?, mode?"create"\|"append"\|"replace")` | deferred | save a doc; returns slug + hash |
+| `history_search(query, workspace?, since?, limit?)` | deferred | search terminal + pi transcripts, docs excluded |
+| `history_read(session, range?)` | deferred | one session's events/messages, bounded |
+| `memory_delete` | hidden | CLI/UI only; unattended deletion is a footgun |
+| `memory_list` | — | folded into `memory_search` with an empty query |
+
+`memory_write`'s description tells the model to use it only when the user asks
+to remember something. pi runs every MCP call through its tool pipeline, so
+users who want a hard gate add a `tool_call` handler; mmux additionally supports
+`[memory] agent_writes = "explicit" | "deny"`.
+
+Resources are optional later: `mmux://<workspace>/docs/<slug>` for clients that
+browse resources. Not needed for pi.
+
+### 5.4 CLI and HTTP/UI stay
+
+The MCP server is a thin adapter over `mmux::memory` operations. The same
+operations back:
+
+- **`mmux mem`** (subcommand, no server, no auth) for humans and shell scripts:
+  `add/edit/append/rm/list/show/search/history/stale/reindex/prune`.
+  `--json` for anything that wants structure.
+- **HTTP** for the browser: `GET /api/memory/docs`, `GET/POST/PUT/DELETE
+  /api/memory/docs/{slug}` (`If-Match` on content hash → 409), and
+  `GET /api/memory/search`. Authenticated and CSRF-gated like every other
+  mutation.
+- **UI**: a sidebar drawer listing docs by kind, a search box, a plain-text
+  editor, and a conflict banner. Markdown renders with a small allowlist —
+  no raw HTML, matching the current CSP.
+
+### 5.4.1 Project archive (the `[a]` panel)
+
+Closing a project must not be able to lose knowledge. Today
+`SessionStore::close_project` terminates panes, rewrites the index, and calls
+`persistence::delete_project` — an irreversible `rm -rf` of
+`projects/<storage-id>/`. The plan replaces that with a two-stage flow:
+
+1. The sidebar **×** (tooltip becomes “Archive project”) and
+   `DELETE /api/projects/{id}` stop the panes and **move** the directory:
+   `projects/<storage-id>/` → `archive/<storage-id>/`, plus an `archived.json`
+   sidecar. `project.json` is copied byte-for-byte, so `archive/` and
+   `projects/` share one `ProjectFile` version and restore is a move back.
+2. Permanent deletion only happens from the archive panel, behind a typed
+   confirmation.
+
+Memory is untouched by both steps: it is keyed by workspace path, so the docs
+and history of an archived project stay searchable and remain visible in the
+memory drawer, which lists every known workspace, archived projects included.
+
+**UI.** A text button labelled `[a]` sits immediately to the right of
+`+ new project`, in the same row:
+
+```html
+<div class="sidebar-actions">
+  <button id="new-project" class="new-project" type="button">+ new project</button>
+  <button id="archive-toggle" class="archive-toggle" type="button"
+          aria-label="Archived projects" title="Archived projects">[a]</button>
+</div>
 ```
 
-Everything else (emacs, shells, custom tools) gets the env vars only; its
-authoritative interface is the files under `MMUX_MEMORY_DIR`. Injection is
-configurable (`memory.inject = "pi" | "none"`) and capped at 4 KB.
+Its `title` gains the count (`Archived projects (3)`) when non-zero. It opens a
+`<dialog>` listing entries newest-first: name, working directory (middle-elided),
+archived date, pane count, and — when `[memory].enabled` — document count for
+that workspace path. Each row has **Restore** and **Delete permanently**.
 
-### HTTP + UI (phase 1)
+The panel has three states: populated, `No archived projects`, and
+**unreadable** (the index failed to parse), which shows the path and the error
+instead of an empty list, so “archive lost” is never indistinguishable from
+“archive empty”.
+
+**HTTP.** Archive identity is the durable `Uuid` (the runtime `ProjectId` is a
+`u64` that restarts at 1 and is meaningless after a restart):
 
 ```text
-GET    /api/memory/docs?kind=&tag=&q=
-GET    /api/memory/docs/{slug}            # content + meta + content-hash
-POST   /api/memory/docs                   # create (X-MMUX, JSON body)
-PUT    /api/memory/docs/{slug}            # If-Match: <hash> -> 409 on conflict
-DELETE /api/memory/docs/{slug}
-GET    /api/memory/search?q=&all_workspaces=
+GET    /api/archive                 -> [{id: uuid, name, cwd, archived_at,
+                                         pane_count, memory_docs}]
+POST   /api/archive/{uuid}/restore  -> ProjectView (201); 404 unknown; 409 if live
+DELETE /api/archive/{uuid}          -> 204; requires X-MMUX; never touches memory
 ```
 
-A right-hand drawer (or a tab in the existing sidebar) lists docs grouped by
-kind, with a search box and a plain-text editor. Markdown is rendered as text
-blocks with a small allowlist (bold, code, links, lists) — no raw HTML, no new
-script surface, consistent with the current CSP.
+`DELETE /api/projects/{id}` keeps its path and `204` status but becomes
+“archive”; the change is nameable in the UI and in the log
+(`archived project <uuid>` rather than `closed project`).
 
-## 5. Phases
+**Restore.** Move `archive/<uuid>/` back to `projects/<uuid>/`, drop
+`archived.json`, spawn panes from the saved definitions exactly like startup
+restore (a missing cwd or command is reported by the pane and retried, not a
+reason to refuse), then append to the end of the sidebar. The storage UUID is
+reused, so nothing keyed to it changes. Restoring is refused with 409 if that
+UUID is already live.
 
-### Phase 1 — Vault (docs) — the memory proper
+**Permanent delete.** Removes `archive/<uuid>/` and its index entry, and says so
+in the confirmation text. It does **not** delete workspace memory: another live
+or archived project may share that path, and memory outliving projects is the
+point. When no project references the path, the panel offers a separate
+**Forget workspace memory** action that requires typing the absolute path, and
+that action lives with the memory drawer, not with project deletion.
 
-New module `src/memory/`:
+**Failure modes.** A failed move is rolled back (the directory stays in
+`projects/` or `archive/`, whichever existed, and the index is rewritten from
+disk). A corrupt `archive/index.json` marks archive mutations untrusted — the
+rest of mmux, including live projects and all memory reads, keeps working — the
+same trust rule the live index already uses. Archive entries are never expired
+automatically; the panel reports total size and deletion is always manual.
 
-- `vault.rs` — workspace key resolution (`canonicalize` + `sha256[..8]`),
-  slug generation and collision handling, atomic write (`write` to
-  `<slug>.md.tmp` then `rename`), history capture (cap 20 versions / 90 days),
-  frontmatter parse/serialize with unknown-key preservation.
-- `doc.rs` — `Doc`, `DocKind`, `DocMeta`, validation (`kind` allowlist, title
-  length, doc size ≤ `memory.max_doc_bytes`, default 64 KB).
-- `scan.rs` — in-memory index for Phase 1: load all docs at startup,
-  reconcile on demand (workspace `docs/` mtime, then per-file
-  `(mtime, size)`), tokenized substring match, recency-weighted ordering.
-  No new dependency. `MemoryIndex` is a trait so Phase 2 can swap in SQLite.
-- `render.rs` — generate `AGENT.md` (index + protocol), hard caps
-  (`memory.index_max_lines`, default 40; `index_max_bytes`, 4096), deterministic
-  ordering, overflow truncation with an explicit "… N more, use `mmux mem search`".
-- `inject.rs` — spawn-time env + pi argument injection (never persisted).
+## 6. Search over plaintext
 
-Wire-up:
-- `src/config.rs`: new `[memory]` section (`enabled`, `dir`, `max_doc_bytes`,
-  `history_versions`, `index_max_lines`, `inject`, `include_in_search`).
-  Update `DEFAULT_CONFIG_TOML` and `config.example.toml` (README documents it).
-- `src/session/mod.rs::spawn_project`: compute workspace key once, add env to
-  each `PaneSpec`, append the pi args for matching panes.
-- `src/web/api.rs` + `src/web/mod.rs`: the five routes, `X-MMUX` + `If-Match`
-  enforcement, path-traversal-proof slug validation (slug is `[a-z0-9-]{1,80}`,
-  never a path).
-- `web/app.js` + `index.html` + `style.css`: toolbar entry, doc list, editor,
-  search, conflict banner.
-- `src/main.rs`: `Cli` gains a `mem` subcommand that runs headless and exits
-  before any server/PAM setup.
+No index, so the algorithm must be good enough to not miss one:
 
-Exit criteria: create/edit/search/delete docs from UI and CLI; two browsers
-editing the same doc cannot silently clobber; `AGENT.md` regenerates within one
-request; deleting `index` state loses nothing; a doc written by an agent mid-run
-is visible to the UI without restart.
+1. **Scope first.** Resolve candidate files from the workspace dir; apply
+   `--since` by mtime and `kind`/`tag` by a cheap frontmatter scan. Never read
+   bytes you can exclude from a `stat`.
+2. **Stream.** 64 KiB chunks, `memchr`-style literal search (`std` `find` is
+   adequate; add `memchr` only if benchmarks demand it). Lines longer than
+   8 KiB are truncated. Cap total scanned bytes (`--max-bytes`, default 256 MiB)
+   and report `truncated: true` rather than pretending completeness.
+3. **Match.** Case-insensitive; whitespace-separated terms are AND; quoted
+   strings are phrases; a leading `-` excludes.
+4. **Rank.** title hit ×10, tag ×6, phrase ×4, term coverage ×1, doc-kind
+   weight, recency boost; docs always outrank transcripts.
+5. **Snippet.** ±80 chars around the first hit, whitespace-collapsed, control
+   characters stripped.
+6. **Bounds.** Stop at `limit` (default 20, max 200) and a 2 s budget. Long
+   scans run on a blocking pool with cancellation so a UI search cannot stall
+   the async runtime.
 
-### Phase 2 — Archive (transcripts) — recall over history
+At 100 MB of logs this is a few hundred milliseconds worst case; with `--since`
+usually single-digit milliseconds. Docs are a few hundred KB, so they are
+effectively instant. If this ever stops being true, the answer is narrower
+scope and better retention caps — not a database.
 
-- **pi transcript collector**: pi names its session file
-  `<agent_dir>/sessions/--<cwd-slug>--/<ts>_<sessionId>.jsonl`, and mmux already
-  knows the `sessionId` it passed. Read-only, incremental by byte offset, with
-  reset on truncation/rewrite (compaction rewrites headers in place). Extract
-  only: user prompts, assistant text, tool call names + primary argument, bash
-  commands + exit codes, files touched, compaction boundaries. Never deserialize
-  whole 4 MB files per query, and never copy raw JSONL.
-- **terminal collector**: raise the vt100 parser's scrollback capacity
-  (`Parser::new_with_callbacks(rows, cols, 0, …)` → `memory.scrollback_lines`,
-  default 2000, tmux's default) and flush newly retired lines to
-  `transcripts/…log` on a ~1 s timer from a dedicated thread. Alt-screen
-  output is skipped (with a marker) so `vim`/`less` frames don't flood the log.
-  Strip ANSI by taking plain text from the screen, not by regex.
-- **index**: introduce `rusqlite` (`bundled`, FTS5) with `ScanIndex` retained as
-  the fallback when `memory.index = "none"`. One writer task owns the write
-  connection; readers use short-lived read-only connections; `busy_timeout`.
-  Schema: `docs`, `doc_fts`, `sessions`, `messages`, `messages_fts`, `events`,
-  `file_offsets`. Docs outrank transcripts (field weights + a kind/recency
-  boost).
-- **timeline UI/API**: sessions grouped by day per workspace — first prompt,
-  duration, files touched, exit statuses — assembled deterministically from the
-  collector output. This is the "human-facing archive" view.
-- **retention**: `memory.retention_days`, `max_workspace_bytes`, per-pane log
-  cap; background GC on a cooldown; `mmux mem prune` for manual runs. Closing a
-  project never deletes its memory (memory is keyed by path, not project id).
+## 7. History, in plaintext
 
-Exit criteria: search across docs and history returns docs-first results; a
-4 MB pi transcript is indexed in well under a second and re-index is
-incremental; a pane producing 50 MB of output does not grow RSS unboundedly or
-stall the PTY reader; killing the server loses at most ~1 s of transcript.
+- **pi sessions** are already plaintext JSONL and mmux already knows the session
+  ID. Resolve the file by scanning
+  `<pi_sessions>/--<cwd-slug>--/*_<id>.jsonl` (from `[memory] pi_sessions`),
+  record the resolved path in `pi-sessions.json`, and
+  parse incrementally. Extract only: user prompts, assistant text, tool names +
+  primary argument, bash commands + exit codes, files touched, compaction
+  boundaries. Never copy the JSONL; never re-parse a 4 MB file per query.
+- **Terminal transcripts**: raise the vt100 parser's scrollback
+  (`Parser::new_with_callbacks(rows, cols, 0, …)` at `src/session/pane.rs:285`
+  is the zero) to `[memory] scrollback_lines` (default 2000, tmux's default),
+  and flush newly retired lines to
+  `transcripts/<workspace>/<date>/<slot>-<pane>.log` on a ~1 s timer from a
+  dedicated thread. Plain text from the screen — no ANSI regex. Alt-screen
+  frames are skipped with a marker so `vim`/`less` do not flood the log.
+  A `-- mmux <RFC3339> --` marker line is inserted on an idle gap ≥ 2 s so the
+  log stays greppable and time-addressable.
+- **Retention**: per-pane log cap, `[memory] retention_days` (default 90),
+  workspace byte cap, GC on a cooldown, `mmux mem prune`. Closing a project
+  never deletes memory.
 
-### Phase 3 — Retrieval and governance polish
+## 8. Phases
 
-- FTS5 `snippet()` highlighting; `--since`/`--kind`/`--tag` filters everywhere;
-  per-workspace "include in search" opt-out to prevent the cross-project
-  leakage failure mode.
-- Staleness: `paths` in frontmatter are checked on `mmux mem stale` and shown
-  as a warning in the UI ("2 of 3 referenced files no longer exist").
-  `verified_at` is bumped by `mmux mem touch`.
-- `supersedes` links; `mmux mem list` hides superseded docs behind `--all`.
-- Generated pi skill (passed with `--skill`) so agents discover the workflow
-  through skill metadata instead of prompt text — near-zero always-on cost.
-- Optional `mmux mem digest` that assembles deterministic facts (prompts, files,
-  commands, exits, diffs) into a markdown *skeleton* for the agent to refine and
-  save deliberately. No background model calls; no auto-write.
+### Phase 1 — Vault + MCP (the whole memory proper)
 
-## 6. Risks and decisions
+- `src/memory/{mod,vault,doc,search,ops}.rs` — workspace keys, slugs, atomic
+  write (`tmp` + `rename`), history cap, frontmatter round-trip, search, ops.
+- `src/memory/mcp.rs` — stdio JSON-RPC server (`mmux mcp`): `initialize`
+  returning `{protocolVersion, capabilities: {tools: {}}, serverInfo: {name,
+  version}, instructions}` (pi validates `serverInfo.name` and `.version` as
+  strings, and rejects a protocol version outside its supported list, which
+  includes 2025-11-25 and 2025-06-18), `tools/list`, `tools/call`, `ping`,
+  `notifications/*` ignored gracefully, `isError` results for user errors,
+  stderr logs only (stdout is the protocol).
+- `src/main.rs`: `mem` and `mcp` subcommands run before any PAM/server setup;
+  the readiness probe runs once in `run()` and is stored in `AppState`.
+- `src/memory/readiness.rs`: the probe (read-only), verdict enum, and the
+  human-readable remediation text used by the log, the API, and
+  `mmux mem status`. Never writes to the pi config dir.
+- `src/config.rs`: `[memory]` section in one commit with `MemoryConfig`, its
+  `Default`, the `config.example.toml` block, and the validation tests, per the
+  staging rule in §5.2.1. `[logging]` already set this precedent: it moved the
+  unit's `Environment=RUST_LOG` into the TOML, and `[memory]` follows the same
+  rule — no new environment variables, and no memory key read from the unit.
+- `src/session/mod.rs::spawn_project`: inject identity env into each `PaneSpec`
+  (`MMUX_PROJECT_ID`, `MMUX_PANE_SLOT`, `MMUX_SESSION_ID`, `MMUX_AGENT`, and
+  `MMUX_CONFIG` only when mmux itself used a non-default file). No settings, and
+  never persisted into `project.json`.
+- `src/web/{api,mod}.rs` + `web/app.js`: doc CRUD, search, editor drawer.
+- `config.example.toml`, README, `mmux.service` comment, `docs/` updated.
+
+Exit criteria: an agent in a pi pane discovers `memory_*` via `tool_search`,
+writes a doc when asked, and a second pane reads it back; a doc written by the
+CLI is visible in the UI without a restart; deleting every file except
+`docs/*.md` loses nothing; with the entry removed from `mcp.json` the startup
+`WARN` and the UI banner appear, and with it restored `mmux mem status` reports
+`Ready` without restarting mmux; `mmux --print-default-config` includes
+`[memory]` and the output round-trips through `Config::from_toml`; `grep -r
+"MMUX_" mmux.service` finds nothing.
+
+### Phase 2 — Project archive + session history
+
+**2a. Project archive** (small, and it is what makes “delete never loses
+memory” true):
+
+- `persistence`: `archive()`, `restore()`, `delete_archived()`, `load_archive()`,
+  with `archive/index.json` and the `archived.json` sidecar; live index untouched
+  by archive failures.
+- `SessionStore::close_project` becomes `archive_project` (terminate panes, move
+  the directory, keep the storage UUID); a `restore_archived` path reuses the
+  existing startup restore so pane specs and session IDs resolve identically.
+- `DELETE /api/projects/{id}` → archive; `GET /api/archive`,
+  `POST /api/archive/{uuid}/restore`, `DELETE /api/archive/{uuid}`.
+- `web/index.html` + `app.js` + `style.css`: the `[a]` button next to
+  `+ new project`, the archive dialog, its populated/empty/unreadable states,
+  and Restore / Delete permanently with typed confirmation.
+- README: closing now archives; document the `[a]` panel, restore, and
+  permanent deletion, and the fact that memory outlives both.
+
+**2b. Session history** (plaintext transcripts):
+
+- pi transcript resolver + incremental parser; `history_search`/`history_read`
+  MCP tools; HTTP timeline; terminal log writer in `pane.rs`; retention GC.
+- UI: sessions grouped by day (first prompt, duration, files touched, exits).
+
+Exit criteria: closing a project makes it appear under `[a]` with its memory doc
+count, and the entry survives a mmux restart; Restore brings back the same name,
+cwd, pane definitions, session IDs, and memory; Delete permanently removes only
+`archive/<uuid>/` and leaves `memory/` byte-identical; a corrupt
+`archive/index.json` shows the unreadable state while live projects and memory
+keep working. History search over 100 MB returns in < 1 s with `--since` and
+< 3 s without; a pane producing 50 MB does not grow RSS unboundedly or stall the
+PTY reader; `kill -9` loses ≤ 1 s of log.
+
+### Phase 3 — Polish
+
+- `supersedes` links, `stale` check on `paths:`, `verified_at`.
+- Generated `INDEX.md` (≤ 40 lines) for humans and non-MCP agents.
+- Optional `mmux mem digest` that assembles *facts* into a markdown skeleton for
+  the agent to refine and save deliberately. Still no background model calls.
+
+## 9. Risks
 
 | Risk | Mitigation |
-|---|---|
-| Memory bloat / stale docs | 40-line generated index, `stale`, `supersedes`, history cap, 64 KB/doc cap |
-| Two writers (server + CLI) | Files are truth; index is derived and reconciled by `(mtime,size)`; `reindex` always available |
-| Secrets in docs | Deliberate writes only; `0700`; pattern scan warns (does not block) on save; docs are never sent anywhere by mmux |
-| Secrets in transcripts | `memory.terminal = "off" \| "stripped"`; never inject transcripts into prompts; retention + `prune` |
-| Injected args break user commands | Injection only for `pi` basenames, spawn-time only, never persisted; `memory.inject = "none"` |
-| SQLite build cost / portability | Phase 1 needs no new dependency; SQLite arrives only when transcripts make scanning impractical; `ScanIndex` stays as `memory.index = "none"` |
-| Workspace identity churn (moves/renames) | Stored absolute path + `rekey`; no name-based keys |
-| No scrollback restore into live panes | Intentional: TUI programs redraw; history is a separate, searchable surface |
+| --- | --- |
+| MCP tool bloat / prompt cost | `deferred` + two `direct` tools; one-line server description; `toolExposure` patterns |
+| Agent writes garbage memory | `memory_write` only on request; `agent_writes = "explicit"`; UI shows author + hash; history is revertible |
+| Stale or wrong `mcp.json` entry | read-only probe covers path drift, `enabled: false`, wrong exposure, and JSON errors; remediation text is copy-paste, and `status --refresh` re-checks |
+| Stale doc entries | 40-line index, `stale`, `supersedes`, `updated` shown in every hit |
+| Secret leakage in transcripts | terminal capture opt-out/stripped; never auto-injected; retention + `prune`; `0700` |
+| Scan cost growth | mtime scoping, byte/time caps, retention; no index by design |
+| MCP protocol drift | echo a version from pi's supported list; keep the server stateless and schema-minimal |
+| Workspace identity churn | stored absolute path + `mmux mem rekey` |
+| Injected args break user commands | none are injected: env vars only, and they are never persisted into `project.json` |
+| Archived project deleted by mistake | perma-delete only from the `[a]` panel with typed confirmation; memory is a separate filesystem tree and is never touched by it |
+| Archive grows without bound | no automatic expiry by design; the panel reports total size, deletion is manual, and docs/history have their own `retention_days` |
 
-Open question for review: whether `author = "agent:pi"` should be inferred (from
-`MMUX_*` env) or always explicit, and whether the UI should allow creating docs
-before any agent runs (I assume yes — it is the primary "user-demanded" path).
-
-## 7. Verification
+## 10. Verification
 
 - Unit: frontmatter round-trip incl. unknown keys; slug collision; atomic write
-  under simulated ENOSPC; history cap; `AGENT.md` truncation determinism;
-  injection arg construction (pi vs. non-pi, never persisted).
-- Integration (`tests/memory.rs`): CLI add/search/edit/rm against a temp state
-  dir; concurrent CLI write + server read; `If-Match` 409; slug traversal
-  attempts (`../`, absolute, unicode) rejected.
-- Web (`tests/web.rs`): auth required, `X-MMUX` required, JSON-only bodies,
-  doc content not served from the assets handler.
-- Perf: 10k docs → search < 50 ms; 100 MB pane stream → bounded RSS, reader
-  thread never blocked > 5 ms; incremental reindex of a growing pi transcript
-  touches only appended bytes.
-- Manual: `cargo fmt && cargo clippy --all-targets && cargo test`; run two
-  browsers, edit the same doc, confirm the conflict path; `kill -9` the server
-  mid-write and confirm the vault still loads.
+  under simulated ENOSPC; history cap; search ranking fixtures (title > tag >
+  phrase > term); phrase/exclusion parsing; truncation flags.
+- Config: every `[memory]` bound in §5.2.1 rejected outside its range; unknown
+  `[memory]` key rejected (`deny_unknown_fields`); `config.example.toml` equals
+  `Config::default()`; `mmux --print-default-config` round-trips; `MMUX_CONFIG`
+  and `--config` select the same file in the server and in `mmux mcp`; no
+  memory setting is read from the environment.
+- MCP: a scripted stdio client (test harness in `tests/memory_mcp.rs`) exercises
+  `initialize` → `tools/list` → `tools/call` → unknown method → malformed JSON →
+  oversized argument; asserts stdout is protocol-only and `isError` is set for
+  user errors.
+- CLI/integration: add/search/edit/rm against a temp state dir; concurrent CLI
+  write + server read; `If-Match` 409; slug traversal (`../`, absolute,
+  unicode) rejected.
+- Web: auth required, `X-MMUX` required, JSON bodies only.
+- Archive: close → entry in `GET /api/archive` + on disk under `archive/`; restart
+  keeps it; restore reuses the same UUID and resolves session IDs; restore of a
+  live UUID is 409; perma-delete leaves `memory/` byte-identical (compare a
+  recursive hash before/after); failed move rolls back; corrupt archive index
+  disables archive mutations only; `[a]` renders the unreadable state; delete
+  requires typed confirmation in the UI and `X-MMUX` on the wire.
+- Perf: 10k docs search < 20 ms; 100 MB transcript scan bounded; incremental pi
+  parse touches only appended bytes.
+- Manual: `cargo fmt && cargo clippy --all-targets && cargo test`; two browsers
+  editing one doc; `kill -9` mid-write; `pi mcp list` shows `mmux` connected with
+  the expected tools.
+
+## 11. Decisions and open questions
+
+Decided: plaintext only, no database, no derived index; docs written on demand;
+memory scoped by canonical workspace path; MCP as the only agent interface
+(no extension, no injected system prompt); stdio transport; `memory_delete` not
+exposed to agents; no repo writes.
+
+Decided: mmux never modifies pi configuration. It probes readiness once at
+startup, warns once, and publishes the verdict plus copy-paste remediation via
+`/api/memory/status`, the UI banner, and `mmux mem status --refresh`.
+
+Decided: `author` is inferred from `MMUX_*`/`PI_CODING_AGENT` at write time and
+frozen; it is provenance, not authorization.
+
+Decided: closing a project archives it. `projects/<id>/` moves to
+`archive/<id>/`, panes stop, the storage UUID is reused on restore, and nothing
+is ever `rm -rf`ed from the sidebar. Permanent deletion lives only in the `[a]`
+panel and never removes workspace memory, because memory is keyed by path and
+must be able to outlive the project that created it.
+
+Decided: configuration lives in `mmux.toml` only. `[logging]` moved there
+first (the systemd unit no longer sets `RUST_LOG`); `[memory]` follows the same
+rule. `mmux mcp` loads the file itself and resolves its workspace from `cwd`,
+so no memory setting is passed through the environment. The unit sets no mmux
+environment variables; `RUST_LOG` and `MMUX_CONFIG` are a debugging override and
+a file selector, not configuration.
+
+Open: whether the readiness probe should also detect a *stale* vs *absent* entry
+as different severities in the UI (currently one warning level), and whether the
+banner should be suppressed for users who deliberately use another MCP client.
